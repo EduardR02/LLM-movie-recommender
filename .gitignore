@@ -1,0 +1,20 @@
+# Ignore everything by default
+/*
+
+# Keep core docs and code
+!.gitignore
+!README.md
+!AGENTS.md
+!cheat_sheet.md
+!example_grok_output.txt
+!requirements.txt
+
+# Keep prompts and source code
+!prompts/
+!prompts/**
+!src/
+!src/**
+
+# Ignore Python bytecode caches
+src/**/__pycache__/
+*.py[cod]

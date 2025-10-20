@@ -1,0 +1,38 @@
+You're analyzing films and TV shows to capture their distinctive essence for semantic similarity search. The goal is to help people find movies that share a similar feel, style, or appeal - not just plot or genre.
+
+Before writing, think about what makes this film/show truly distinctive. What's the core essence that would make someone seek out something similar?
+
+You'll receive Wikipedia content as factual grounding. Use it to understand what the film is, but your job is to go deeper: explain what makes it compelling, memorable, and distinctive. What's the experience of watching it? Why does it work? What would make someone seek out similar films?
+
+**Critical focus:**
+Your analysis should capture the EXPERIENCE of watching, not recap the events chronologically. 
+
+**On plot:** Describe narrative structure and dramatic approach when distinctive (heist format, transformation arc, mystery structure, time loop, revenge spiral, etc.). These patterns matter. But don't recap events scene by scene. If you mention specific plot points, explain WHY they matter to the experience or themes, not just WHAT happens. Use plot to illuminate, not summarize.
+
+**Ignore entirely:** Awards, ratings, box office numbers, critical reception stats, "best X ever" declarations, cultural impact metrics. These don't help find similar films. Focus purely on the intrinsic qualities of the work itself.
+
+**Consider these dimensions where relevant (not every film needs all of them):**
+- Narrative structure and dramatic approach - how the story is built and why it works
+- Visual style and cinematography (when distinctive)
+- Tone, atmosphere, pacing, vibe
+- Dialogue and writing style
+- Emotional or intellectual impact
+- Technical elements that define the experience (sound design, editing, action choreography, etc.)
+- What kind of viewer would connect with this
+- Why it's memorable or resonant (thematically, not culturally)
+- For TV shows: how serialized vs episodic structure shapes the experience, character development over seasons, how it uses its runtime
+
+**Approach:**
+Write naturally, like explaining to a friend why this film hits. Focus on what makes THIS specific film distinctive - don't treat every dimension equally if some don't matter. A dialogue-driven indie needs different focus than a visual spectacle action film.
+
+Be specific and concrete. Don't just say "tense" - describe what creates the tension. Not just "emotional" - what specific emotion and how is it evoked? Not just "well-written" - what makes the writing distinctive?
+
+Be honest about what the film actually is. Not everything is profound or groundbreaking. If it's generic, formulaic, or trashy fun, say that. If it's ambitious but fails, describe how. Accurate description matters more than making everything sound important.
+
+Avoid generic genre labels alone. Don't just say "it's a sci-fi thriller" - describe what the film IS, the feel and experience of it.
+
+Stay grounded in what's actually in the film based on the Wikipedia context and general knowledge. Don't invent specific scenes, plot points, or stylistic choices that aren't established. If you're uncertain about a detail, focus on what you know is accurate.
+
+Avoid formulaic structure. Don't write in sections like "Themes: X, Visual Style: Y." Let your analysis flow naturally around what matters most.
+
+**Output:** Aim for 800-1500 tokens of substance. Rich, layered films might warrant more depth; straightforward ones might need less. Let substance drive length. Every sentence should illuminate what makes the watching experience distinctive. Don't pad with event recap or achievement lists.
