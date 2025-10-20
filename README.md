@@ -32,3 +32,9 @@ Also funny, this entire project was writtien by codex-cli with gpt-5-codex - ide
 - **Visualization** – `python -m movie_pipeline.embedding_plot` renders quick 2D scatters (ratings/genre tinted) for sanity checks.
 
 Refer to `cheat_sheet.md` for CLI examples and workflow switches (profiles, limits, force rebuilds). The `prompts/` directory contains the system prompts used during Grok runs so each profile can be versioned alongside the code.
+
+## Plot
+Here is the plot for the 6000 highest rated movies and tv shows, using the embeddings from the system_different.txt prompt - the two big clusters are movies and tv shows. 
+
+![Embedding Plot (First 6000 Titles)](images/plot.png)
+

@@ -9,12 +9,19 @@
 !example_grok_output.txt
 !requirements.txt
 
-# Keep prompts and source code
+# Keep prompts and source code and readme images
 !prompts/
 !prompts/**
 !src/
 !src/**
+!images/
+!images/**
+
+# ignore plots
+src/artifacts/**
+
 
 # Ignore Python bytecode caches
+.DS_STORE
 src/**/__pycache__/
 *.py[cod]
