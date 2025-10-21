@@ -8,7 +8,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from openai import OpenAI
 
@@ -390,6 +390,63 @@ def top_k_similar(
     best_indices = np.argpartition(partition_scores, limit - 1)[:limit]
     best_pairs = ((ids[i], float(scores[i])) for i in best_indices)
     return sorted(best_pairs, key=sort_key)
+
+
+def combine_embeddings(
+    vectors: Sequence[Sequence[float]],
+    *,
+    weights: Sequence[float] | None = None,
+    weight_tolerance: float = 1e-5,
+):
+    """Blend unit-length embeddings and return a normalized centroid."""
+    import numpy as np
+
+    if not vectors:
+        raise ValueError("At least one embedding vector is required.")
+
+    arrays: list[np.ndarray] = []
+    filtered_weights: list[float] = []
+    for index, vector in enumerate(vectors):
+        arr = np.asarray(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(arr))
+        if norm == 0.0:
+            LOGGER.warning("Skipping zero-length embedding at index %d", index)
+            continue
+        arrays.append(arr / norm)
+        if weights is not None:
+            filtered_weights.append(weights[index])
+
+    if not arrays:
+        raise ValueError("All embedding vectors were zero-length; cannot combine.")
+
+    stack = np.stack(arrays, axis=0)
+
+    if weights is None:
+        combined = stack.mean(axis=0)
+    else:
+        if len(weights) != len(vectors):
+            raise ValueError(
+                f"Expected {len(vectors)} weight(s) but received {len(weights)}."
+            )
+        if len(filtered_weights) != stack.shape[0]:
+            raise ValueError(
+                "Weights associated with zero-length embeddings cannot be applied."
+            )
+        weight_array = np.asarray(filtered_weights, dtype=np.float32)
+        if (weight_array < 0).any():
+            raise ValueError("Weights must be non-negative.")
+        total = float(weight_array.sum())
+        if total == 0.0:
+            raise ValueError("Weights must sum to a positive value.")
+        if not np.isclose(total, 1.0, atol=weight_tolerance):
+            raise ValueError("Weights must sum to 1.0.")
+        combined = np.average(stack, axis=0, weights=weight_array)
+
+    combined_norm = float(np.linalg.norm(combined))
+    if combined_norm == 0.0:
+        raise ValueError("Combined embedding norm is zero.")
+    return (combined / combined_norm).astype(np.float32)
+
 
 @dataclass
 class PlotEmbeddingCandidate:

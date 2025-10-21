@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from .embeddings import (
     EmbeddingRunner,
     PlotEmbeddingRunner,
     OpenAIEmbeddingClient,
+    combine_embeddings,
     load_embedding_vector,
     load_embeddings_matrix,
     top_k_similar,
@@ -79,6 +81,35 @@ def _read_analysis_text(tconst: str) -> str | None:
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Failed to read analysis for %s: %s", tconst, exc)
         return None
+
+
+def _resolve_title_identifier(
+    manifest: Manifest,
+    identifier: str,
+    *,
+    matches: int,
+) -> TitleRecord:
+    narrowed = identifier.strip()
+    if not narrowed:
+        raise SystemExit("Provide a non-empty title identifier.")
+    if narrowed.lower().startswith("tt"):
+        record = manifest.get_title(narrowed)
+        if not record:
+            raise SystemExit(f"No manifest record found for {narrowed}.")
+        return record
+    results = manifest.search_titles(narrowed, limit=matches)
+    if not results:
+        raise SystemExit(f"No titles matched '{narrowed}'.")
+    record = results[0]
+    year = record.start_year or "????"
+    print(f"Resolved '{narrowed}' → {record.primary_title} ({year}) [{record.tconst}]")
+    if len(results) > 1:
+        suggestions = [
+            f"{candidate.primary_title} ({candidate.start_year or '????'})"
+            for candidate in results[1:]
+        ]
+        print("Other matches:", "; ".join(suggestions))
+    return record
 
 
 def _truncate_lines(text: str, max_lines: int) -> str:
@@ -454,52 +485,59 @@ def cmd_query_text(args: argparse.Namespace) -> None:
 
 def cmd_query_title(args: argparse.Namespace) -> None:
     manifest = Manifest(profile=args.profile)
-    identifier = args.identifier.strip()
-    resolved = None
-    if identifier.lower().startswith("tt"):
-        resolved = manifest.get_title(identifier)
-        if not resolved:
-            raise SystemExit(f"No manifest record found for {identifier}.")
-        tconst = resolved.tconst
-    else:
-        matches = manifest.search_titles(identifier, limit=args.matches)
-        if not matches:
-            raise SystemExit(f"No titles matched '{identifier}'.")
-        resolved = matches[0]
-        tconst = resolved.tconst
-        year = resolved.start_year or "????"
-        print(f"Resolved '{identifier}' → {resolved.primary_title} ({year}) [{tconst}]")
-        if len(matches) > 1:
-            suggestions = [
-                f"{record.primary_title} ({record.start_year or '????'})"
-                for record in matches[1:]
-            ]
-            print("Other matches:", "; ".join(suggestions))
+    identifiers = [identifier.strip() for identifier in args.identifiers if identifier.strip()]
+    if not identifiers:
+        raise SystemExit("Provide at least one title identifier.")
 
     try:
         directory = _resolve_embedding_dir(args.index, ACTIVE_PROFILE)
     except KeyError:
         raise SystemExit(f"Unknown embedding index '{args.index}'.")
 
-    try:
-        query_vector, vector_dim = load_embedding_vector(tconst, vectors_dir=directory)
-    except FileNotFoundError:
-        raise SystemExit(
-            f"Embedding not found for {tconst}. Run compute-embeddings first."
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise SystemExit(str(exc)) from exc
-
     ids, matrix, stored_dim = load_embeddings_matrix(directory)
     if matrix.size == 0:
         raise SystemExit("No embeddings available. Run compute-embeddings first.")
-    if vector_dim != stored_dim:
-        LOGGER.warning(
-            "Vector dimension %d for %s differs from stored matrix dimension %d.",
-            vector_dim,
-            tconst,
-            stored_dim,
+
+    seed_records: list[TitleRecord] = []
+    vectors: list = []
+    for identifier in identifiers:
+        record = _resolve_title_identifier(
+            manifest,
+            identifier,
+            matches=args.matches,
         )
+        seed_records.append(record)
+        try:
+            vector, vector_dim = load_embedding_vector(record.tconst, vectors_dir=directory)
+        except FileNotFoundError:
+            raise SystemExit(
+                f"Embedding not found for {record.tconst}. Run compute-embeddings first."
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SystemExit(str(exc)) from exc
+        if vector_dim != stored_dim:
+            LOGGER.warning(
+                "Vector dimension %d for %s differs from stored matrix dimension %d.",
+                vector_dim,
+                record.tconst,
+                stored_dim,
+            )
+        vectors.append(vector)
+
+    weights = args.weights
+    if weights is not None:
+        if len(weights) != len(seed_records):
+            raise SystemExit("Number of --weights values must match the number of seeds.")
+        if any(weight < 0 for weight in weights):
+            raise SystemExit("Weights must be non-negative.")
+        total = sum(weights)
+        if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            raise SystemExit("Weights must sum to 1.0.")
+    try:
+        query_vector = combine_embeddings(vectors, weights=weights)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     results = top_k_similar(
         matrix,
         query_vector,
@@ -520,9 +558,10 @@ def cmd_query_title(args: argparse.Namespace) -> None:
         print(f"{score:.4f} | {label}")
 
     if args.show_analysis:
-        print("\nSeed analysis:")
-        if resolved:
-            _print_analysis_snippet(resolved, lines=args.analysis_lines)
+        print("\nSeed analyses:")
+        if seed_records:
+            for record in seed_records:
+                _print_analysis_snippet(record, lines=args.analysis_lines)
         else:
             print("  [Seed analysis unavailable]")
         if collected:
@@ -531,30 +570,34 @@ def cmd_query_title(args: argparse.Namespace) -> None:
                 _print_analysis_snippet(record, lines=args.analysis_lines)
 
     if getattr(args, "compare", None):
+        anchor = seed_records[0] if len(seed_records) == 1 else None
         _handle_compare(
-            seed=resolved,
+            seed=anchor,
             matches=collected,
             indexes=args.compare,
             lines=args.analysis_lines,
         )
 
     if args.explain:
-        if resolved:
-            seed_text = _read_analysis_text(resolved.tconst)
-            if seed_text:
-                seed = SeedContext(label=_format_title_label(resolved), summary=seed_text)
-            else:
-                print("Seed analysis missing; cannot generate explanation.")
-                seed = None
-        else:
-            seed = None
-        if seed:
+        summaries: list[str] = []
+        for record in seed_records:
+            text = _read_analysis_text(record.tconst)
+            if text:
+                summaries.append(f"{_format_title_label(record)}\n{text}")
+        if summaries:
+            label_parts = [_format_title_label(record) for record in seed_records]
+            seed = SeedContext(
+                label=f"Combined seeds: {' + '.join(label_parts)}",
+                summary="\n\n".join(summaries),
+            )
             _generate_explanation(
                 seed=seed,
                 records=collected,
                 top_k=args.explain_top,
                 indexes=args.explain_index or None,
             )
+        else:
+            print("Seed analyses missing; cannot generate explanation.")
 
 
 def cmd_show_title(args: argparse.Namespace) -> None:
@@ -938,9 +981,13 @@ def build_parser() -> argparse.ArgumentParser:
     query_text_parser.set_defaults(func=cmd_query_text)
 
     query_title_parser = subparsers.add_parser(
-        "query-title", help="Find similar titles to a given movie/series."
+        "query-title", help="Find similar titles to one or more seed titles."
     )
-    query_title_parser.add_argument("identifier", help="IMDb ID (tt...) or title text.")
+    query_title_parser.add_argument(
+        "identifiers",
+        nargs="+",
+        help="IMDb IDs (tt...) or title text. Provide multiple values to blend them.",
+    )
     query_title_parser.add_argument("--top-k", type=int, default=10)
     query_title_parser.add_argument(
         "--matches",
@@ -964,6 +1011,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="Number of lines to show from each analysis when --show-analysis is used.",
+    )
+    query_title_parser.add_argument(
+        "--weights",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Weights for each seed (must sum to 1.0).",
     )
     query_title_parser.add_argument(
         "--compare",
