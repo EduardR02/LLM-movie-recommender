@@ -19,6 +19,7 @@
 
 # ignore plots
 src/artifacts/**
+**.html
 
 
 # Ignore Python bytecode caches

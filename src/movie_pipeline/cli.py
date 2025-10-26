@@ -17,6 +17,7 @@ from .embeddings import (
     PlotEmbeddingRunner,
     OpenAIEmbeddingClient,
     combine_embeddings,
+    intersection_similar,
     load_embedding_vector,
     load_embeddings_matrix,
     top_k_similar,
@@ -524,27 +525,43 @@ def cmd_query_title(args: argparse.Namespace) -> None:
             )
         vectors.append(vector)
 
+    score_mode = args.score_mode
     weights = args.weights
-    if weights is not None:
-        if len(weights) != len(seed_records):
-            raise SystemExit("Number of --weights values must match the number of seeds.")
-        if any(weight < 0 for weight in weights):
-            raise SystemExit("Weights must be non-negative.")
-        total = sum(weights)
-        if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
-            raise SystemExit("Weights must sum to 1.0.")
-    try:
-        query_vector = combine_embeddings(vectors, weights=weights)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+    if score_mode == "intersection" and weights is not None:
+        raise SystemExit("--weights can only be used with --score-mode centroid.")
 
-    results = top_k_similar(
-        matrix,
-        query_vector,
-        ids,
-        top_k=args.top_k,
-        largest=not args.least_similar,
-    )
+    if score_mode == "centroid":
+        if weights is not None:
+            if len(weights) != len(seed_records):
+                raise SystemExit("Number of --weights values must match the number of seeds.")
+            if any(weight < 0 for weight in weights):
+                raise SystemExit("Weights must be non-negative.")
+            total = sum(weights)
+            if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+                raise SystemExit("Weights must sum to 1.0.")
+        try:
+            query_vector = combine_embeddings(vectors, weights=weights)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+        results = top_k_similar(
+            matrix,
+            query_vector,
+            ids,
+            top_k=args.top_k,
+            largest=not args.least_similar,
+        )
+    else:
+        try:
+            results = intersection_similar(
+                matrix,
+                vectors,
+                ids,
+                top_k=args.top_k,
+                largest=not args.least_similar,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     collected: list[tuple[TitleRecord, float]] = []
     if args.least_similar and results:
         print("Least similar matches:")
@@ -1018,6 +1035,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Weights for each seed (must sum to 1.0).",
+    )
+    query_title_parser.add_argument(
+        "--score-mode",
+        choices=("centroid", "intersection"),
+        default="centroid",
+        help="Blend seeds via centroid (default) or require overlap with intersection scoring.",
     )
     query_title_parser.add_argument(
         "--compare",

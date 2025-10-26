@@ -392,6 +392,51 @@ def top_k_similar(
     return sorted(best_pairs, key=sort_key)
 
 
+def intersection_similar(
+    matrix,
+    seed_vectors: Sequence[Sequence[float]],
+    ids: list[str],
+    *,
+    top_k: int = 10,
+    largest: bool = True,
+) -> list[tuple[str, float]]:
+    """Return titles ranked by the minimum similarity across all seed vectors."""
+    import numpy as np
+
+    if top_k <= 0 or matrix.size == 0:
+        return []
+    normalized: list[np.ndarray] = []
+    for index, vector in enumerate(seed_vectors):
+        arr = np.asarray(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(arr))
+        if norm == 0.0:
+            LOGGER.warning("Skipping zero-length seed embedding at index %d", index)
+            continue
+        normalized.append(arr / norm)
+    if not normalized:
+        raise ValueError("At least one non-zero seed embedding is required.")
+
+    seed_stack = np.stack(normalized, axis=0)  # (num_seeds, dim)
+    score_matrix = matrix @ seed_stack.T  # (num_titles, num_seeds)
+    aggregated = score_matrix.min(axis=1)
+
+    total = aggregated.shape[0]
+    limit = min(top_k, total)
+    if limit == 0:
+        return []
+
+    if largest:
+        partition_scores = -aggregated
+        sort_key = lambda item: -item[1]
+    else:
+        partition_scores = aggregated
+        sort_key = lambda item: item[1]
+
+    best_indices = np.argpartition(partition_scores, limit - 1)[:limit]
+    best_pairs = ((ids[i], float(aggregated[i])) for i in best_indices)
+    return sorted(best_pairs, key=sort_key)
+
+
 def combine_embeddings(
     vectors: Sequence[Sequence[float]],
     *,

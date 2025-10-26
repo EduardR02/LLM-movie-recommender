@@ -33,6 +33,7 @@ propcache==0.4.1
 protobuf==6.33.0
 pydantic==2.12.2
 pydantic-core==2.41.4
+plotly==6.3
 pyparsing==3.2.5
 python-dateutil==2.9.0.post0
 requests==2.32.5
