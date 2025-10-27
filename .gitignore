@@ -16,10 +16,17 @@
 !src/**
 !images/
 !images/**
+!ui/
+!ui/**
+
+# Front-end build artifacts
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+/ui/.eslintcache
 
 # ignore plots
 src/artifacts/**
-**.html
 
 
 # Ignore Python bytecode caches
