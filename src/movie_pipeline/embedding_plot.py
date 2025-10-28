@@ -19,9 +19,9 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 PLOTLY_TEMPLATE = TEMPLATES_DIR / "plotly_embedding.html"
 
 
-def _resolve_index_dir(index: str, profile: str) -> Path:
+def _resolve_index_dir(index: str, profile: str, embedding_set: str | None = None) -> Path:
     if index == "analysis":
-        return embeddings_dir(profile)
+        return embeddings_dir(profile, embedding_set)
     if index == "plot":
         PATHS.plot_embeddings.mkdir(parents=True, exist_ok=True)
         return PATHS.plot_embeddings
@@ -148,6 +148,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Embedding set to load (analysis or plot).",
     )
     parser.add_argument(
+        "--embedding-set",
+        default="default",
+        help="Embedding variant directory (analysis index only).",
+    )
+    parser.add_argument(
         "--sample",
         type=int,
         default=None,
@@ -225,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    directory = _resolve_index_dir(args.index, args.profile)
+    directory = _resolve_index_dir(args.index, args.profile, args.embedding_set)
     ids, matrix, _ = load_embeddings_matrix(directory)
     if matrix.size == 0:
         print(f"No embeddings found in {directory}.", file=sys.stderr)

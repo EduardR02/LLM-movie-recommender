@@ -87,7 +87,10 @@ class AnalysisRunner:
     def __init__(self, manifest: Manifest, config: AnalysisConfig | None = None) -> None:
         self.manifest = manifest
         self.config = config or AnalysisConfig()
-        self.profile = getattr(self.manifest, "profile", "default")
+        profile = getattr(self.manifest, "profile", None)
+        if profile is None or not str(profile).strip():
+            raise ValueError("Manifest.profile must be set before running analyses.")
+        self.profile = str(profile).strip()
         self.analysis_dir = analyses_dir(self.profile)
         self.api_key = os.environ.get("XAI_API_KEY")
         if not self.api_key:

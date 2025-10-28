@@ -16,10 +16,14 @@ from .embeddings import (
     EmbeddingRunner,
     PlotEmbeddingRunner,
     OpenAIEmbeddingClient,
+    QwenEmbeddingClient,
+    SentenceTransformerEmbeddingClient,
     combine_embeddings,
     intersection_similar,
     load_embedding_vector,
     load_embeddings_matrix,
+    resolve_embedding_instruction,
+    is_qwen_embedding_model,
     top_k_similar,
 )
 from .imdb import IMDbConfig, ingest_imdb
@@ -40,9 +44,9 @@ ACTIVE_PROFILE = "default"
 EMBEDDING_INDEX_CHOICES = ("analysis", "plot")
 
 
-def _resolve_embedding_dir(index: str, profile: str) -> Path:
+def _resolve_embedding_dir(index: str, profile: str, *, embedding_set: str | None = None) -> Path:
     if index == "analysis":
-        return embeddings_dir(profile)
+        return embeddings_dir(profile, embedding_set)
     if index == "plot":
         PATHS.plot_embeddings.mkdir(parents=True, exist_ok=True)
         return PATHS.plot_embeddings
@@ -389,11 +393,22 @@ def cmd_run_analysis(args: argparse.Namespace) -> None:
 
 def cmd_compute_embeddings(args: argparse.Namespace) -> None:
     manifest = Manifest(profile=args.profile)
+    provider = (args.provider or "openai").strip().lower()
+    instruction = resolve_embedding_instruction(
+        provider,
+        args.model,
+        args.instruction,
+        for_query=False,
+    )
     config = EmbeddingConfig(
+        provider=provider,
         model=args.model,
+        embedding_set=args.embedding_set,
         batch_size=args.batch_size,
         dry_run=args.dry_run,
-        dimensions=args.dimensions,
+        dimensions=args.dimensions if provider == "openai" else None,
+        device=args.device,
+        instruction=instruction,
     )
     runner = EmbeddingRunner(manifest, config=config)
     runner.run(limit=args.limit, force=args.force)
@@ -413,7 +428,11 @@ def cmd_compute_plot_embeddings(args: argparse.Namespace) -> None:
 
 def cmd_query_text(args: argparse.Namespace) -> None:
     try:
-        directory = _resolve_embedding_dir(args.index, ACTIVE_PROFILE)
+        directory = _resolve_embedding_dir(
+            args.index,
+            ACTIVE_PROFILE,
+            embedding_set=args.embedding_set,
+        )
     except KeyError:
         raise SystemExit(f"Unknown embedding index '{args.index}'.")
 
@@ -430,8 +449,23 @@ def cmd_query_text(args: argparse.Namespace) -> None:
             target_dim,
         )
 
-    config = EmbeddingConfig(model=args.model, dimensions=target_dim)
-    client = _build_openai_client(config)
+    provider = (args.provider or "openai").strip().lower()
+    instruction = resolve_embedding_instruction(
+        provider,
+        args.model,
+        args.instruction,
+        for_query=True,
+    )
+    config = EmbeddingConfig(
+        provider=provider,
+        model=args.model,
+        embedding_set=args.embedding_set,
+        dimensions=target_dim if provider == "openai" else None,
+        device=args.device,
+        instruction=instruction,
+        batch_size=1,
+    )
+    client = _build_embedding_client(config)
     embeddings, _ = client.embed([args.text])
     query_vector = embeddings[0]
 
@@ -491,7 +525,11 @@ def cmd_query_title(args: argparse.Namespace) -> None:
         raise SystemExit("Provide at least one title identifier.")
 
     try:
-        directory = _resolve_embedding_dir(args.index, ACTIVE_PROFILE)
+        directory = _resolve_embedding_dir(
+            args.index,
+            ACTIVE_PROFILE,
+            embedding_set=args.embedding_set,
+        )
     except KeyError:
         raise SystemExit(f"Unknown embedding index '{args.index}'.")
 
@@ -659,6 +697,17 @@ def cmd_show_title(args: argparse.Namespace) -> None:
     if args.analysis:
         analysis_text = _read_analysis_text(record.tconst)
         _print_text_block("Analysis", analysis_text, lines=args.lines)
+
+
+def _build_embedding_client(config: EmbeddingConfig):
+    provider = (config.provider or "openai").strip().lower()
+    if provider == "openai":
+        return _build_openai_client(config)
+    if provider in {"sentence-transformers", "huggingface", "hf"}:
+        if is_qwen_embedding_model(config.model):
+            return QwenEmbeddingClient(config)
+        return SentenceTransformerEmbeddingClient(config)
+    raise SystemExit(f"Unsupported embedding provider '{config.provider}'.")
 
 
 def _build_openai_client(config: EmbeddingConfig) -> OpenAIEmbeddingClient:
@@ -899,7 +948,18 @@ def build_parser() -> argparse.ArgumentParser:
         "compute-embeddings", help="Generate embeddings for Grok analyses."
     )
     embed_parser.add_argument("--limit", type=int, default=None)
+    embed_parser.add_argument(
+        "--provider",
+        choices=("openai", "sentence-transformers"),
+        default="openai",
+        help="Embedding provider: 'openai' or local 'sentence-transformers'.",
+    )
     embed_parser.add_argument("--model", default="text-embedding-3-large")
+    embed_parser.add_argument(
+        "--embedding-set",
+        default="default",
+        help="Name for embedding variant directory (default: default).",
+    )
     embed_parser.add_argument("--batch-size", type=int, default=32)
     embed_parser.add_argument("--dry-run", action="store_true")
     embed_parser.add_argument(
@@ -907,6 +967,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1024,
         help="Optional embedding dimensionality (e.g., 1024 or 3072).",
+    )
+    embed_parser.add_argument(
+        "--device",
+        default=None,
+        help="Device identifier for local models (e.g., cuda, cuda:0, cpu).",
+    )
+    embed_parser.add_argument(
+        "--instruction",
+        default=None,
+        help=(
+            "Optional instruction prefix or template for local embeddings. "
+            "Use '{text}' placeholder to control formatting."
+        ),
     )
     embed_parser.add_argument(
         "--force",
@@ -940,6 +1013,23 @@ def build_parser() -> argparse.ArgumentParser:
         "query-text", help="Find similar titles for a free-text query."
     )
     query_text_parser.add_argument("text")
+    query_text_parser.add_argument(
+        "--index",
+        default="analysis",
+        choices=EMBEDDING_INDEX_CHOICES,
+        help="Embedding index to search (analysis or plot).",
+    )
+    query_text_parser.add_argument(
+        "--embedding-set",
+        default="default",
+        help="Embedding variant directory to search (default: default).",
+    )
+    query_text_parser.add_argument(
+        "--provider",
+        choices=("openai", "sentence-transformers"),
+        default="openai",
+        help="Provider to use for embedding the query text.",
+    )
     query_text_parser.add_argument("--model", default="text-embedding-3-large")
     query_text_parser.add_argument("--top-k", type=int, default=10)
     query_text_parser.add_argument(
@@ -949,10 +1039,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override embedding dimensionality (defaults to stored vector size).",
     )
     query_text_parser.add_argument(
-        "--index",
-        default="analysis",
-        choices=EMBEDDING_INDEX_CHOICES,
-        help="Embedding index to search (analysis or plot).",
+        "--device",
+        default=None,
+        help="Device override for local query embeddings (e.g., cuda).",
+    )
+    query_text_parser.add_argument(
+        "--instruction",
+        default=None,
+        help="Instruction prefix/template when using local embeddings.",
     )
     query_text_parser.add_argument(
         "--show-analysis",
@@ -1017,6 +1111,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="analysis",
         choices=EMBEDDING_INDEX_CHOICES,
         help="Embedding index to search (analysis or plot).",
+    )
+    query_title_parser.add_argument(
+        "--embedding-set",
+        default="default",
+        help="Embedding variant directory to use (default: default).",
     )
     query_title_parser.add_argument(
         "--show-analysis",

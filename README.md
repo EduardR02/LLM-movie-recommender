@@ -7,7 +7,7 @@ Instead of doing the usual wikipedia plot summary -> embeddings -> cosine simila
 - use grok-4-fast-reasoning and have it TRY ITS BEST to generate why a movie is compelling based on the wikipedia data only as a starting point to keep hallucination minimal
 - this is important - wikipedia plot summaries are not perfect for why a movie is compelling to watch - there are many other things. Take Blade Runner 2049 as an example. The plot summary is almost useless for why this movie is cool. this is why we need grok - it adds all these additional aspects for why one might like a movie
 - we run this for all the 11.7k movies and tv shows - lol.
-- then we take the grok texts and embed them using openai's text-embedding-3-large (reduced to 1024 dim because that doesn't seem to affect performance)
+- then we take the grok texts and embed them (OpenAI `text-embedding-3-large` by default, but you can swap in local models like Qwen's 4B embedder)
 
 and boom - hopefully we now have a better recommender than the naive version.
 
@@ -118,7 +118,7 @@ Also funny, this entire project was writtien by codex-cli with gpt-5-codex - ide
 - **Ingestion** – `fetch-imdb` downloads the official IMDb TSV snapshots and writes a filtered manifest into SQLite.
 - **Plot harvesting** – `fetch-plots` maps titles to Wikipedia pages, cleans the text, and stores both raw and cleaned plots.
 - **LLM enrichment** – `run-analysis` calls Grok (xAI) to produce rich per-title analyses, tracking usage and status per profile.
-- **Embeddings** – `compute-embeddings` (and `compute-plot-embeddings`) send batches to OpenAI for vector representations, saved per profile for A/B prompts.
+- **Embeddings** – `compute-embeddings` (and `compute-plot-embeddings`) now support OpenAI or local `sentence-transformers` models, storing vectors per profile/embedding-set for easy A/B runs. This is really cool - apparently openai embeddings aren't that great anymore - qwen seem to be sota! and we can easily run them locally because they have 0.6, 4B, and 8B models.
 - **Queries** – `query-text` and `query-title` surface nearest neighbours with optional analysis snippets and Grok-on-Grok explanations.
 - **Visualization** – `python -m movie_pipeline.embedding_plot` renders quick 2D scatters (ratings/genre tinted) for sanity checks.
 

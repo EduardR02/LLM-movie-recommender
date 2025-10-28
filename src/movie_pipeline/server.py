@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from functools import lru_cache
+import os
+import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Literal, Sequence
+from threading import Lock
+from typing import Dict, Iterable, Iterator, Literal, Sequence, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,9 +19,12 @@ from pydantic import BaseModel, Field
 from .embeddings import (
     EmbeddingConfig,
     OpenAIEmbeddingClient,
+    QwenEmbeddingClient,
+    SentenceTransformerEmbeddingClient,
     combine_embeddings,
+    resolve_embedding_instruction,
+    is_qwen_embedding_model,
     intersection_similar,
-    load_embedding_vector,
     load_embeddings_matrix,
     top_k_similar,
 )
@@ -32,6 +40,7 @@ from .paths import PATHS, analyses_dir, embeddings_dir
 LOGGER = logging.getLogger(__name__)
 
 EMBEDDING_INDEX_CHOICES = ("analysis", "plot")
+TITLE_WITH_YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)$")
 
 
 # -----------------------------------------------------------------------------
@@ -39,7 +48,10 @@ EMBEDDING_INDEX_CHOICES = ("analysis", "plot")
 # -----------------------------------------------------------------------------
 
 def _normalize_profile(profile: str | None) -> str:
-    return (profile or "default").strip() or "default"
+    value = (profile or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Profile is required.")
+    return value
 
 
 def _analysis_path(profile: str, tconst: str) -> Path:
@@ -86,32 +98,216 @@ def _title_to_payload(record: TitleRecord) -> dict:
 
 
 def _discover_profiles() -> list[str]:
-    profiles = {"default"}
+    manifest = Manifest()
+    profiles: set[str] = set()
+    with manifest.cursor() as cur:
+        for row in cur.execute(
+            """
+            SELECT DISTINCT profile FROM analyses
+            UNION
+            SELECT DISTINCT profile FROM embeddings
+            ORDER BY profile ASC;
+            """
+        ):
+            value = (row[0] or "").strip()
+            if value:
+                profiles.add(value)
+    if profiles:
+        manifest.close()
+        return sorted(profiles)
+
     for base in (PATHS.analyses, PATHS.embeddings):
         if not base.exists():
             continue
         for child in base.iterdir():
             if child.is_dir():
-                profiles.add(child.name)
+                name = child.name.strip()
+                if name and not name.startswith("."):
+                    profiles.add(name)
+    manifest.close()
     return sorted(profiles)
 
 
-@lru_cache(maxsize=32)
-def _load_embeddings(index: str, profile: str):
+def _embedding_meta_path(directory: Path) -> Path:
+    return directory / ".cache" / "matrix.meta.json"
+
+
+@dataclass
+class EmbeddingCacheEntry:
+    ids: list[str]
+    matrix: object
+    dimension: int
+    directory: Path
+    index: dict[str, int]
+    meta_mtime_ns: int | None
+
+
+_EMBEDDING_CACHE: dict[tuple[str, str, str], EmbeddingCacheEntry] = {}
+LOCAL_EMBEDDING_PROVIDERS = {"sentence-transformers", "huggingface", "hf"}
+
+
+@dataclass
+class LocalClientEntry:
+    client: SentenceTransformerEmbeddingClient | QwenEmbeddingClient
+    config: EmbeddingConfig
+    refcount: int
+    last_used: float
+
+
+class LocalModelRegistry:
+    """Reference-counted cache for local embedding clients."""
+
+    def __init__(self) -> None:
+        self._entries: dict[Tuple[str, str, str, str, int, int], LocalClientEntry] = {}
+        self._lock = Lock()
+
+    def _key(self, config: EmbeddingConfig) -> Tuple[str, str, str, str, int, int]:
+        provider = (config.provider or "sentence-transformers").strip().lower()
+        model = (config.model or "").strip()
+        device = (config.device or "").strip()
+        instruction = (config.instruction or "").strip()
+        dimensions = int(config.dimensions or 0)
+        max_length = int(config.max_length or 0)
+        return (provider, model, device, instruction, dimensions, max_length)
+
+    def ensure(self, config: EmbeddingConfig, client: SentenceTransformerEmbeddingClient | QwenEmbeddingClient) -> None:
+        key = self._key(config)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry:
+                entry.refcount += 1
+                entry.last_used = time.time()
+                return
+            self._entries[key] = LocalClientEntry(
+                client=client,
+                config=config,
+                refcount=1,
+                last_used=time.time(),
+            )
+
+    def release(self, config: EmbeddingConfig) -> bool | None:
+        key = self._key(config)
+        with self._lock:
+            entry = self._entries.get(key)
+            if not entry:
+                return None
+            entry.refcount -= 1
+            should_close = entry.refcount <= 0
+            if should_close:
+                self._entries.pop(key, None)
+        if should_close:
+            with contextlib.suppress(Exception):
+                if hasattr(entry.client, "flush"):
+                    entry.client.flush()
+            with contextlib.suppress(Exception):
+                if hasattr(entry.client, "close"):
+                    entry.client.close()
+        return should_close
+
+    def get(self, config: EmbeddingConfig) -> SentenceTransformerEmbeddingClient | QwenEmbeddingClient | None:
+        key = self._key(config)
+        with self._lock:
+            entry = self._entries.get(key)
+            if not entry:
+                return None
+            entry.last_used = time.time()
+            return entry.client
+
+
+_LOCAL_MODEL_REGISTRY = LocalModelRegistry()
+
+
+def _normalize_provider(provider: str | None, *, default: str) -> str:
+    value = (provider or default).strip().lower()
+    return value or default
+
+
+@contextlib.contextmanager
+def _embedding_client_session(
+    config: EmbeddingConfig,
+) -> Iterator[OpenAIEmbeddingClient | SentenceTransformerEmbeddingClient | QwenEmbeddingClient]:
+    provider = _normalize_provider(config.provider, default="openai")
+    if provider == "openai":
+        client = _build_openai_client(config)
+        try:
+            yield client
+        finally:
+            with contextlib.suppress(Exception):
+                if hasattr(client, "flush"):
+                    client.flush()
+        return
+
+    if provider not in LOCAL_EMBEDDING_PROVIDERS:
+        raise RuntimeError(f"Unsupported embedding provider '{config.provider}'.")
+
+    client = _LOCAL_MODEL_REGISTRY.get(config)
+    if client is None:
+        client = _create_local_embedding_client(config)
+    _LOCAL_MODEL_REGISTRY.ensure(config, client)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            if hasattr(client, "flush"):
+                client.flush()
+        _LOCAL_MODEL_REGISTRY.release(config)
+
+
+def _load_embeddings(index: str, profile: str, embedding_set: str | None = None) -> EmbeddingCacheEntry:
     if index == "analysis":
-        directory = embeddings_dir(profile)
+        directory = embeddings_dir(profile, embedding_set)
+        variant = (embedding_set or "default").strip() or "default"
     elif index == "plot":
         PATHS.plot_embeddings.mkdir(parents=True, exist_ok=True)
         directory = PATHS.plot_embeddings
+        variant = "plot"
     else:
         raise HTTPException(status_code=400, detail=f"Unknown embedding index '{index}'.")
+
+    cache_key = (index, profile, variant)
+    meta_path = _embedding_meta_path(directory)
+    try:
+        meta_mtime_ns = meta_path.stat().st_mtime_ns
+    except FileNotFoundError:
+        meta_mtime_ns = None
+
+    entry = _EMBEDDING_CACHE.get(cache_key)
+    if entry and entry.meta_mtime_ns == meta_mtime_ns:
+        if entry.matrix.size == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No embeddings found for index '{index}' (profile '{profile}', "
+                    f"variant '{variant}')."
+                ),
+            )
+        return entry
+
     ids, matrix, dims = load_embeddings_matrix(directory)
     if matrix.size == 0:
         raise HTTPException(
             status_code=404,
-            detail=f"No embeddings found for index '{index}' (profile '{profile}').",
+            detail=(
+                f"No embeddings found for index '{index}' (profile '{profile}', "
+                f"variant '{variant}')."
+            ),
         )
-    return ids, matrix, dims, directory
+    try:
+        meta_mtime_ns = meta_path.stat().st_mtime_ns
+    except FileNotFoundError:
+        meta_mtime_ns = None
+
+    index_map = {tconst: idx for idx, tconst in enumerate(ids)}
+    entry = EmbeddingCacheEntry(
+        ids=ids,
+        matrix=matrix,
+        dimension=dims,
+        directory=directory,
+        index=index_map,
+        meta_mtime_ns=meta_mtime_ns,
+    )
+    _EMBEDDING_CACHE[cache_key] = entry
+    return entry
 
 
 _MANIFEST_CACHE: Dict[str, Manifest] = {}
@@ -144,9 +340,52 @@ def _resolve_titles(
                 raise HTTPException(status_code=404, detail=f"No title found for {clean}.")
             seed_records.append(record)
             continue
-        results = manifest.search_titles(clean, limit=matches)
+        search_title = clean
+        target_year: int | None = None
+        match = TITLE_WITH_YEAR_RE.match(clean)
+        if match:
+            search_title = match.group("title").strip()
+            try:
+                target_year = int(match.group("year"))
+            except ValueError:
+                target_year = None
+
+        results = manifest.search_titles(search_title, limit=matches)
         if not results:
             raise HTTPException(status_code=404, detail=f"No titles matched '{clean}'.")
+
+        normalized_search = search_title.casefold()
+        exact_match = next(
+            (
+                record
+                for record in results
+                if record.primary_title.casefold() == normalized_search
+            ),
+            None,
+        )
+        if exact_match:
+            if target_year and exact_match.start_year != target_year:
+                exact_match = next(
+                    (
+                        record
+                        for record in results
+                        if record.primary_title.casefold() == normalized_search
+                        and record.start_year == target_year
+                    ),
+                    exact_match,
+                )
+            seed_records.append(exact_match)
+            continue
+
+        if target_year:
+            year_candidate = next(
+                (record for record in results if record.start_year == target_year),
+                None,
+            )
+            if year_candidate:
+                seed_records.append(year_candidate)
+                continue
+
         seed_records.append(results[0])
     if not seed_records:
         raise HTTPException(status_code=400, detail="Provide at least one seed title.")
@@ -240,9 +479,31 @@ class Recommendation(BaseModel):
     plot_preview: str | None = None
 
 
+class EmbeddingSetInfo(BaseModel):
+    name: str
+    provider: str
+    model: str | None = None
+    dimension: int | None = None
+    vector_count: int = 0
+    updated_at: str | None = None
+
+
+class EmbeddingSetResponse(BaseModel):
+    embedding_sets: list[EmbeddingSetInfo]
+
+
+class ManifestSummaryResponse(BaseModel):
+    total_titles: int
+    plot_count: int
+    wikipedia_articles: int
+    analysis_count: int
+    embedding_count: int
+
+
 class TitleQueryRequest(BaseModel):
-    profile: str = Field(default="default")
+    profile: str = Field(..., min_length=1)
     index: Literal["analysis", "plot"] = Field(default="analysis")
+    embedding_set: str = Field(default="default")
     identifiers: list[str] = Field(min_items=1)
     top_k: int = Field(default=10, ge=1, le=100)
     matches: int = Field(default=5, ge=1, le=20)
@@ -256,16 +517,28 @@ class TitleQueryRequest(BaseModel):
 
 
 class TextQueryRequest(BaseModel):
-    profile: str = Field(default="default")
+    profile: str = Field(..., min_length=1)
     index: Literal["analysis", "plot"] = Field(default="analysis")
     text: str = Field(min_length=3, max_length=5000)
     top_k: int = Field(default=10, ge=1, le=100)
+    least_similar: bool = False
+    embedding_set: str = Field(default="default")
+    provider: Literal["openai", "sentence-transformers"] = Field(default="openai")
     model: str = Field(default="text-embedding-3-large")
     dimensions: int | None = None
+    device: str | None = None
+    instruction: str | None = None
     include_analysis: bool = False
     include_plot: bool = False
     analysis_preview_chars: int = Field(default=480, ge=50, le=2000)
     plot_preview_chars: int = Field(default=480, ge=50, le=2000)
+
+
+class TextClientRequest(BaseModel):
+    provider: str = Field(default="sentence-transformers")
+    model: str
+    device: str | None = None
+    instruction: str | None = None
 
 
 class TitleSearchResponse(BaseModel):
@@ -296,7 +569,7 @@ class TextSearchResponse(BaseModel):
 
 
 class ExplanationRequest(BaseModel):
-    profile: str = Field(default="default")
+    profile: str = Field(..., min_length=1)
     seed_ids: list[str] = Field(min_items=1, max_items=10)
     candidate_id: str
     candidate_score: float | None = None
@@ -336,10 +609,39 @@ def list_indexes() -> dict[str, Sequence[str]]:
     return {"indexes": EMBEDDING_INDEX_CHOICES}
 
 
+@app.get("/api/embedding-sets", response_model=EmbeddingSetResponse)
+def list_embedding_sets(profile: str = Query(..., min_length=1)) -> EmbeddingSetResponse:
+    manifest = _manifest(profile)
+    entries = manifest.list_embedding_variants(profile=profile)
+    variants = [
+        EmbeddingSetInfo(
+            name=str(entry.get("name") or "").strip(),
+            provider=str(entry.get("provider")) if entry.get("provider") else "openai",
+            model=entry.get("model"),
+            dimension=entry.get("dimension"),
+            vector_count=int(entry.get("vector_count", 0) or 0),
+            updated_at=entry.get("updated_at"),
+        )
+        for entry in entries
+        if str(entry.get("name") or "").strip()
+    ]
+    variants.sort(key=lambda item: item.name)
+    return EmbeddingSetResponse(embedding_sets=variants)
+
+
+@app.get("/api/manifest/summary", response_model=ManifestSummaryResponse)
+def manifest_summary(
+    profile: str = Query(..., min_length=1),
+    variant: str | None = Query(None, alias="embedding_set"),
+) -> ManifestSummaryResponse:
+    manifest = _manifest(profile)
+    stats = manifest.summary_stats(profile=profile, variant=variant)
+    return ManifestSummaryResponse(**stats.__dict__)
+
 @app.get("/api/titles/search", response_model=TitleSearchResponse)
 def search_titles(
     q: str = Query(min_length=1),
-    profile: str = Query("default"),
+    profile: str = Query(..., min_length=1),
     limit: int = Query(10, ge=1, le=50),
 ) -> TitleSearchResponse:
     manifest = _manifest(profile)
@@ -350,7 +652,7 @@ def search_titles(
 @app.get("/api/titles/{identifier}", response_model=TitleDetailResponse)
 def fetch_title(
     identifier: str,
-    profile: str = Query("default"),
+    profile: str = Query(..., min_length=1),
     matches: int = Query(5, ge=1, le=20),
     include_plot: bool = Query(False),
     include_analysis: bool = Query(False),
@@ -387,20 +689,31 @@ def query_by_title(request: TitleQueryRequest) -> RecommendationResponse:
     profile = _normalize_profile(request.profile)
     manifest = _manifest(profile)
     seed_records = _resolve_titles(manifest, request.identifiers, matches=request.matches)
-    ids, matrix, stored_dim, _directory = _load_embeddings(request.index, profile)
+    embedding_entry = _load_embeddings(
+        request.index,
+        profile,
+        request.embedding_set,
+    )
 
     vectors = []
     for record in seed_records:
-        vector, vector_dim = load_embedding_vector(
-            record.tconst,
-            vectors_dir=_directory,
-        )
-        if vector_dim != stored_dim:
+        idx = embedding_entry.index.get(record.tconst)
+        if idx is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No embedding stored for {record.tconst}. "
+                    "Re-run the embedding pipeline for this profile/variant."
+                ),
+            )
+        vector = embedding_entry.matrix[idx]
+        vector_dim = vector.shape[-1]
+        if vector_dim != embedding_entry.dimension:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Vector dimension mismatch for {record.tconst}: "
-                    f"{vector_dim} vs matrix dim {stored_dim}"
+                    f"{vector_dim} vs matrix dim {embedding_entry.dimension}"
                 ),
             )
         vectors.append(vector)
@@ -419,9 +732,9 @@ def query_by_title(request: TitleQueryRequest) -> RecommendationResponse:
                 raise HTTPException(status_code=400, detail="Weights must sum to 1.0.")
         query_vector = combine_embeddings(vectors, weights=request.weights)
         results = top_k_similar(
-            matrix,
+            embedding_entry.matrix,
             query_vector,
-            ids,
+            embedding_entry.ids,
             top_k=request.top_k,
             largest=not request.least_similar,
         )
@@ -432,9 +745,9 @@ def query_by_title(request: TitleQueryRequest) -> RecommendationResponse:
                 detail="weights can only be used with score_mode='centroid'.",
             )
         results = intersection_similar(
-            matrix,
+            embedding_entry.matrix,
             vectors,
-            ids,
+            embedding_entry.ids,
             top_k=request.top_k,
             largest=not request.least_similar,
         )
@@ -454,18 +767,84 @@ def query_by_title(request: TitleQueryRequest) -> RecommendationResponse:
     )
 
 
+@app.post("/api/text/client/hold")
+def hold_text_client(request: TextClientRequest) -> dict[str, object]:
+    provider = _normalize_provider(request.provider, default="sentence-transformers")
+    if provider not in LOCAL_EMBEDDING_PROVIDERS:
+        return {"status": "ignored", "provider": provider}
+    instruction = resolve_embedding_instruction(provider, request.model, request.instruction, for_query=True)
+    config = EmbeddingConfig(
+        provider=provider,
+        model=request.model,
+        device=request.device,
+        instruction=instruction,
+        dimensions=None,
+        batch_size=1,
+    )
+    client = _LOCAL_MODEL_REGISTRY.get(config)
+    if client is None:
+        try:
+            client = _create_local_embedding_client(config)
+        except RuntimeError as exc:  # pragma: no cover - depends on model availability
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    _LOCAL_MODEL_REGISTRY.ensure(config, client)
+    return {"status": "ready", "provider": provider, "model": request.model}
+
+
+@app.post("/api/text/client/release")
+def release_text_client(request: TextClientRequest) -> dict[str, object]:
+    provider = _normalize_provider(request.provider, default="sentence-transformers")
+    if provider not in LOCAL_EMBEDDING_PROVIDERS:
+        return {"status": "ignored", "provider": provider}
+    instruction = resolve_embedding_instruction(provider, request.model, request.instruction, for_query=True)
+    config = EmbeddingConfig(
+        provider=provider,
+        model=request.model,
+        device=request.device,
+        instruction=instruction,
+        dimensions=None,
+        batch_size=1,
+    )
+    outcome = _LOCAL_MODEL_REGISTRY.release(config)
+    if outcome is None:
+        return {"status": "missing", "provider": provider, "model": request.model}
+    if outcome:
+        return {"status": "released", "provider": provider, "model": request.model}
+    return {"status": "retained", "provider": provider, "model": request.model}
+
+
 @app.post("/api/query/text", response_model=RecommendationResponse)
 def query_by_text(request: TextQueryRequest) -> RecommendationResponse:
     profile = _normalize_profile(request.profile)
-    ids, matrix, stored_dim, _ = _load_embeddings(request.index, profile)
+    embedding_entry = _load_embeddings(
+        request.index,
+        profile,
+        request.embedding_set,
+    )
+    matrix = embedding_entry.matrix
+    stored_dim = embedding_entry.dimension
     target_dim = request.dimensions or stored_dim
-    config = EmbeddingConfig(model=request.model, dimensions=target_dim)
+    provider = _normalize_provider(request.provider, default="openai")
+    instruction = resolve_embedding_instruction(
+        provider,
+        request.model,
+        request.instruction,
+        for_query=True,
+    )
+    config = EmbeddingConfig(
+        provider=provider,
+        model=request.model,
+        embedding_set=request.embedding_set,
+        dimensions=target_dim if provider == "openai" else None,
+        device=request.device,
+        instruction=instruction,
+        batch_size=1,
+    )
     try:
-        client = _build_embedding_client(config)
+        with _embedding_client_session(config) as client:
+            embeddings, _ = client.embed([request.text])
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    try:
-        embeddings, _ = client.embed([request.text])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     query_vector = embeddings[0]
@@ -473,16 +852,16 @@ def query_by_text(request: TextQueryRequest) -> RecommendationResponse:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Query vector dimension {len(query_vector)} "
-                f"does not match stored dim {stored_dim}."
+                f"Query embedding dimension mismatch: expected {stored_dim}, "
+                f"received {len(query_vector)}"
             ),
         )
     results = top_k_similar(
         matrix,
         query_vector,
-        ids,
+        embedding_entry.ids,
         top_k=request.top_k,
-        largest=True,
+        largest=not request.least_similar,
     )
     manifest = _manifest(profile)
     recommendations = _build_recommendations(
@@ -510,13 +889,19 @@ def query_by_text(request: TextQueryRequest) -> RecommendationResponse:
     return RecommendationResponse(seeds=[seed_summary], results=recommendations)
 
 
-def _build_embedding_client(config: EmbeddingConfig) -> OpenAIEmbeddingClient:
-    import os
-
+def _build_openai_client(config: EmbeddingConfig) -> OpenAIEmbeddingClient:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for text queries.")
     return OpenAIEmbeddingClient(api_key, config)
+
+
+def _create_local_embedding_client(
+    config: EmbeddingConfig,
+) -> SentenceTransformerEmbeddingClient | QwenEmbeddingClient:
+    if is_qwen_embedding_model(config.model):
+        return QwenEmbeddingClient(config)
+    return SentenceTransformerEmbeddingClient(config)
 
 
 def _build_recommendations(
@@ -560,7 +945,7 @@ def _build_recommendations(
 @app.get("/api/text/search", response_model=TextSearchResponse)
 def search_text(
     target: Literal["analysis", "plot"] = Query(...),
-    profile: str = Query("default"),
+    profile: str = Query(..., min_length=1),
     q: str = Query(min_length=2),
     limit: int = Query(10, ge=1, le=50),
 ) -> TextSearchResponse:

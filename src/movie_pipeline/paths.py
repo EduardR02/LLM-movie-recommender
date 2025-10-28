@@ -71,20 +71,29 @@ PATHS = discover_paths()
 
 
 def _ensure_profile_dir(base: Path, profile: str) -> Path:
-    normalized = (profile or "default").strip()
-    if normalized in ("", "default"):
-        base.mkdir(parents=True, exist_ok=True)
-        return base
-    target = base / normalized
+    normalized = (profile or "").strip()
+    if not normalized:
+        raise ValueError("Profile is required for profile-specific paths.")
+    target = base if normalized == "default" else base / normalized
     target.mkdir(parents=True, exist_ok=True)
     return target
 
 
 def analyses_dir(profile: str | None = None) -> Path:
     """Return the directory for Grok analyses for the given profile."""
-    return _ensure_profile_dir(PATHS.analyses, profile or "default")
+    if profile is None or not str(profile).strip():
+        raise ValueError("Profile is required for analyses_dir.")
+    return _ensure_profile_dir(PATHS.analyses, str(profile))
 
 
-def embeddings_dir(profile: str | None = None) -> Path:
-    """Return the directory for analysis embeddings for the given profile."""
-    return _ensure_profile_dir(PATHS.embeddings, profile or "default")
+def embeddings_dir(profile: str | None = None, variant: str | None = None) -> Path:
+    """Return the directory for analysis embeddings for the given profile and variant."""
+    if profile is None or not str(profile).strip():
+        raise ValueError("Profile is required for embeddings_dir.")
+    base = _ensure_profile_dir(PATHS.embeddings, str(profile))
+    normalized_variant = (variant or "default").strip() or "default"
+    if normalized_variant in {"", "default"}:
+        return base
+    target = base / normalized_variant
+    target.mkdir(parents=True, exist_ok=True)
+    return target

@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useMemo, useState } from 'react';
+import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 
 type TitleSummary = {
@@ -52,6 +52,23 @@ type ExpansionEntry = {
   loadingAnalysis?: boolean;
   loadingPlot?: boolean;
   loadingExplanation?: boolean;
+};
+
+type EmbeddingSetInfo = {
+  name: string;
+  provider: string;
+  model?: string | null;
+  dimension?: number | null;
+  vector_count?: number;
+  updated_at?: string | null;
+};
+
+type ManifestSummary = {
+  total_titles: number;
+  plot_count: number;
+  wikipedia_articles: number;
+  analysis_count: number;
+  embedding_count: number;
 };
 
 const DEFAULT_SEEDS = ['Blade Runner 2049', 'Her'].join('\n');
@@ -111,36 +128,166 @@ const getImdbUrl = (tconst: string) => `https://www.imdb.com/title/${tconst}/`;
 
 const numberFormatter = new Intl.NumberFormat('en-US');
 
+const formatEmbeddingLabel = (set: EmbeddingSetInfo) => {
+  if (set.provider && set.provider !== 'openai' && set.provider !== set.name) {
+    return `${set.name} (${set.provider})`;
+  }
+  return set.name;
+};
+
 function App() {
-  const [profiles, setProfiles] = useState<string[]>(['default']);
+  const [profiles, setProfiles] = useState<string[]>([]);
   const [indexes, setIndexes] = useState<string[]>(['analysis']);
-  const [selectedProfile, setSelectedProfile] = useState('default');
+  const [selectedProfile, setSelectedProfile] = useState('');
   const [selectedIndex, setSelectedIndex] = useState('analysis');
+  const [embeddingSets, setEmbeddingSets] = useState<EmbeddingSetInfo[]>([]);
+  const [selectedEmbeddingSet, setSelectedEmbeddingSet] = useState('');
+  const [bootstrapLoading, setBootstrapLoading] = useState(true);
   const [activeTool, setActiveTool] = useState<ToolKey>('title');
+  const [manifestSummary, setManifestSummary] = useState<ManifestSummary | null>(null);
+  const [manifestLoading, setManifestLoading] = useState(false);
+  const [manifestError, setManifestError] = useState<string | null>(null);
+  const activeEmbeddingSet =
+    selectedIndex === 'analysis' && selectedEmbeddingSet ? selectedEmbeddingSet : undefined;
 
   useEffect(() => {
     const loadInitial = async () => {
+      setBootstrapLoading(true);
       try {
-        const profilePayload = await fetch('/api/profiles').then((res) => res.json());
-        const indexPayload = await fetch('/api/indexes').then((res) => res.json());
+        const [profilePayload, indexPayload] = await Promise.all([
+          fetch('/api/profiles').then((res) => res.json()),
+          fetch('/api/indexes').then((res) => res.json()),
+        ]);
         if (Array.isArray(profilePayload?.profiles) && profilePayload.profiles.length) {
           setProfiles(profilePayload.profiles);
           if (!profilePayload.profiles.includes(selectedProfile)) {
             setSelectedProfile(profilePayload.profiles[0]);
           }
+        } else {
+          setProfiles([]);
+          setSelectedProfile('');
         }
         if (Array.isArray(indexPayload?.indexes) && indexPayload.indexes.length) {
           setIndexes(indexPayload.indexes);
           if (!indexPayload.indexes.includes(selectedIndex)) {
             setSelectedIndex(indexPayload.indexes[0]);
           }
+        } else {
+          setIndexes([]);
+          setSelectedIndex('');
         }
       } catch (error) {
         console.error('Failed to bootstrap UI', error);
+      } finally {
+        setBootstrapLoading(false);
       }
     };
     loadInitial();
   }, []);
+
+  useEffect(() => {
+    if (!selectedProfile) {
+      setEmbeddingSets([]);
+      setSelectedEmbeddingSet('');
+      return;
+    }
+    let cancelled = false;
+    const loadEmbeddingSets = async () => {
+      try {
+        const params = new URLSearchParams({ profile: selectedProfile });
+        const payload = await fetch(`/api/embedding-sets?${params.toString()}`).then((res) =>
+          res.json(),
+        );
+        if (cancelled) {
+          return;
+        }
+        const fetchedSets = Array.isArray(payload?.embedding_sets)
+          ? payload.embedding_sets
+          : [];
+        const normalizedSets = fetchedSets.reduce((acc: EmbeddingSetInfo[], raw: Partial<EmbeddingSetInfo>) => {
+          const trimmedName = (raw?.name ?? '').trim();
+          if (!trimmedName) {
+            return acc;
+          }
+          acc.push({
+            name: trimmedName,
+            provider: raw?.provider ?? 'openai',
+            model: raw?.model ?? null,
+            dimension: raw?.dimension ?? null,
+            vector_count: raw?.vector_count ?? 0,
+            updated_at: raw?.updated_at ?? null,
+          });
+          return acc;
+        }, [] as EmbeddingSetInfo[]);
+        const previous = selectedEmbeddingSet;
+        const availableNames = new Set(normalizedSets.map((set: EmbeddingSetInfo) => set.name));
+        const nextSelection = availableNames.has(previous)
+          ? previous
+          : normalizedSets[0]?.name ?? '';
+        setEmbeddingSets(normalizedSets);
+        if (nextSelection !== previous) {
+          setSelectedEmbeddingSet(nextSelection);
+        }
+      } catch (error) {
+        console.error('Failed to load embedding sets', error);
+        if (!cancelled) {
+          setEmbeddingSets([]);
+          setSelectedEmbeddingSet('');
+        }
+      }
+    };
+    loadEmbeddingSets();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProfile]);
+
+  useEffect(() => {
+    if (!selectedProfile) {
+      setManifestSummary(null);
+      return;
+    }
+    if (selectedIndex === 'analysis' && !selectedEmbeddingSet) {
+      setManifestSummary(null);
+      return;
+    }
+    let cancelled = false;
+    const fetchSummary = async () => {
+      setManifestLoading(true);
+      setManifestError(null);
+      try {
+        const params = new URLSearchParams({ profile: selectedProfile });
+        if (activeEmbeddingSet) {
+          params.set('embedding_set', activeEmbeddingSet);
+        } else if (selectedIndex === 'plot') {
+          params.set('embedding_set', 'plot');
+        }
+        const payload = await fetch(`/api/manifest/summary?${params.toString()}`).then((res) => {
+          if (!res.ok) {
+            throw new Error('Failed to load manifest summary');
+          }
+          return res.json() as Promise<ManifestSummary>;
+        });
+        if (!cancelled) {
+          setManifestSummary(payload);
+        }
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setManifestSummary(null);
+          setManifestError(error instanceof Error ? error.message : 'Failed to load summary');
+        }
+      } finally {
+        if (!cancelled) {
+          setManifestLoading(false);
+        }
+      }
+    };
+    fetchSummary();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProfile, selectedIndex, activeEmbeddingSet, selectedEmbeddingSet]);
 
   const [titleSeeds, setTitleSeeds] = useState(DEFAULT_SEEDS);
   const [titleTopK, setTitleTopK] = useState(10);
@@ -152,6 +299,24 @@ function App() {
   const [includePlot, setIncludePlot] = useState(false);
   const [titleControlsCollapsed, setTitleControlsCollapsed] = useState(false);
   const [titleControlsPinned, setTitleControlsPinned] = useState(false);
+
+  const activeEmbedding = useMemo<EmbeddingSetInfo>(() => {
+    if (selectedIndex !== 'analysis') {
+      return { name: 'default', provider: 'openai', model: 'text-embedding-3-large' };
+    }
+    const match = embeddingSets.find((set) => set.name === selectedEmbeddingSet);
+    if (match) {
+      return match;
+    }
+    return embeddingSets[0] ?? { name: 'default', provider: 'openai', model: 'text-embedding-3-large' };
+  }, [embeddingSets, selectedEmbeddingSet, selectedIndex]);
+
+  const activeEmbeddingProvider = activeEmbedding.provider ?? 'openai';
+  const activeEmbeddingModel =
+    activeEmbedding.model ??
+    (activeEmbeddingProvider === 'openai'
+      ? 'text-embedding-3-large'
+      : 'Qwen/Qwen3-Embedding-4B');
 
   const parsedSeeds = useMemo(
     () =>
@@ -174,10 +339,94 @@ function App() {
   const [textTopKInput, setTextTopKInput] = useState('10');
   const [textIncludeAnalysis, setTextIncludeAnalysis] = useState(true);
   const [textIncludePlot, setTextIncludePlot] = useState(false);
+  const textClientRef = useRef<{ provider: string; model: string; device: string | null } | null>(null);
   const [textLoading, setTextLoading] = useState(false);
   const [textError, setTextError] = useState<string | null>(null);
   const [textResponse, setTextResponse] =
     useState<RecommendationResponse | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const releaseClient = async (info: { provider: string; model: string; device: string | null }) => {
+      try {
+        await fetch('/api/text/client/release', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(info),
+        });
+      } catch (error) {
+        console.error('Failed to release embedding model', error);
+      }
+    };
+
+    const clearClient = (info: { provider: string; model: string; device: string | null } | null) => {
+      if (!info) {
+        return;
+      }
+      textClientRef.current = null;
+      void releaseClient(info);
+    };
+
+    const providerKey = (activeEmbeddingProvider || '').toLowerCase();
+
+    if (activeTool !== 'text' || providerKey === 'openai') {
+      if (textClientRef.current) {
+        clearClient(textClientRef.current);
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const desired = {
+      provider: activeEmbeddingProvider,
+      model: activeEmbeddingModel,
+      device: null,
+    };
+
+    if (
+      textClientRef.current &&
+      (textClientRef.current.provider !== desired.provider ||
+        textClientRef.current.model !== desired.model ||
+        textClientRef.current.device !== desired.device)
+    ) {
+      clearClient(textClientRef.current);
+    }
+
+    if (!textClientRef.current) {
+      const holdClient = async () => {
+        try {
+          const response = await fetch('/api/text/client/hold', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(desired),
+          });
+          if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message || 'Failed to warm embedding model');
+          }
+          if (cancelled) {
+            await releaseClient(desired);
+            return;
+          }
+          textClientRef.current = desired;
+        } catch (error) {
+          console.error('Failed to warm embedding model', error);
+        }
+      };
+      void holdClient();
+    }
+
+    return () => {
+      cancelled = true;
+      if (textClientRef.current) {
+        const info = textClientRef.current;
+        textClientRef.current = null;
+        void releaseClient(info);
+      }
+    };
+  }, [activeTool, activeEmbeddingProvider, activeEmbeddingModel]);
 
   const [titleSearchTerm, setTitleSearchTerm] = useState('');
   const [titleMatches, setTitleMatches] = useState<TitleSummary[]>([]);
@@ -203,6 +452,10 @@ function App() {
       setTitleQueryError('Add at least one seed title or IMDb ID.');
       return;
     }
+    if (!selectedProfile) {
+      setTitleQueryError('Select a profile to run recommendations.');
+      return;
+    }
     const resolvedTopK = clampTopKInput(titleTopKInput, titleTopK);
     if (resolvedTopK !== titleTopK) {
       setTitleTopK(resolvedTopK);
@@ -219,6 +472,7 @@ function App() {
         body: JSON.stringify({
           profile: selectedProfile,
           index: selectedIndex,
+          embedding_set: activeEmbeddingSet,
           identifiers,
           top_k: resolvedTopK,
           score_mode: titleScoreMode,
@@ -257,6 +511,10 @@ function App() {
       setTextError('Enter a phrase describing what you want to watch.');
       return;
     }
+    if (!selectedProfile) {
+      setTextError('Select a profile to run text search.');
+      return;
+    }
     const resolvedTopK = clampTopKInput(textTopKInput, textTopK);
     if (resolvedTopK !== textTopK) {
       setTextTopK(resolvedTopK);
@@ -273,6 +531,9 @@ function App() {
         body: JSON.stringify({
           profile: selectedProfile,
           index: selectedIndex,
+          embedding_set: activeEmbeddingSet,
+          provider: activeEmbeddingProvider,
+          model: activeEmbeddingModel,
           text: textQuery,
           top_k: resolvedTopK,
           include_analysis: textIncludeAnalysis,
@@ -297,6 +558,10 @@ function App() {
     if (!titleSearchTerm.trim()) {
       setTitleMatches([]);
       setTitleSearchError('Enter a partial title.');
+      return;
+    }
+    if (!selectedProfile) {
+      setTitleSearchError('Select a profile to browse the manifest.');
       return;
     }
     setTitleSearchLoading(true);
@@ -329,6 +594,9 @@ function App() {
 
   const fetchFullText = async (tconst: string, { analysis, plot }: { analysis?: boolean; plot?: boolean }) => {
     if (!analysis && !plot) {
+      return;
+    }
+    if (!selectedProfile) {
       return;
     }
     setExpansions((prev) => ({
@@ -501,6 +769,9 @@ function App() {
   };
 
   const loadDetails = async (identifier: string) => {
+    if (!selectedProfile) {
+      return;
+    }
     setDetailLoading(true);
     try {
       const params = new URLSearchParams({
@@ -529,6 +800,10 @@ function App() {
     if (!textSearchTerm.trim()) {
       setTextMatches([]);
       setTextSearchError('Enter a fragment to search for.');
+      return;
+    }
+    if (!selectedProfile) {
+      setTextSearchError('Select a profile to search stored text.');
       return;
     }
     setTextSearchLoading(true);
@@ -584,6 +859,7 @@ function App() {
                     />
                     <p className="help-text">
                       Start with a single title for straight recs. Add extra lines only when you need a blended tone.
+                      {' '}Append a year in parentheses (e.g. <code>Her (2013)</code>) if you want to pin a specific release.
                     </p>
                   </label>
                   <div className="control-stack">
@@ -641,11 +917,11 @@ function App() {
                       </label>
                     </div>
                     <div className="action-row">
-                      <button
-                        type="submit"
-                        className="primary"
-                        disabled={titleQueryLoading}
-                      >
+                  <button
+                    type="submit"
+                    className="primary"
+                    disabled={titleQueryLoading || !selectedProfile}
+                  >
                         {titleQueryLoading ? 'Searching…' : 'Run title search'}
                       </button>
                     </div>
@@ -865,7 +1141,11 @@ function App() {
                   </label>
                 </div>
                 <div className="action-row">
-                  <button type="submit" className="primary" disabled={textLoading}>
+                  <button
+                    type="submit"
+                    className="primary"
+                    disabled={textLoading || !selectedProfile}
+                  >
                     {textLoading ? 'Embedding…' : 'Run text search'}
                   </button>
                   {textError && <p className="error">{textError}</p>}
@@ -1008,7 +1288,7 @@ function App() {
                 <button
                   type="submit"
                   className="primary"
-                  disabled={titleSearchLoading}
+                  disabled={titleSearchLoading || !selectedProfile}
                 >
                   {titleSearchLoading ? 'Searching…' : 'Search manifest'}
                 </button>
@@ -1020,6 +1300,69 @@ function App() {
                 <div>
                   <p className="eyebrow small">Manifest</p>
                   <h3>Stored metadata</h3>
+                </div>
+                <div className="summary-grid">
+                  {manifestLoading ? (
+                    <div className="stat-card muted">
+                      <span className="stat-label">Manifest</span>
+                      <span className="stat-value">Loading…</span>
+                    </div>
+                  ) : manifestError ? (
+                    <div className="stat-card error">
+                      <span className="stat-label">Manifest</span>
+                      <span className="stat-value">{manifestError}</span>
+                    </div>
+                  ) : manifestSummary ? (
+                    <>
+                      <div className="stat-card">
+                        <span className="stat-label">Titles indexed</span>
+                        <span className="stat-value">
+                          {numberFormatter.format(manifestSummary.total_titles)}
+                        </span>
+                      </div>
+                      <div className="stat-card">
+                        <span className="stat-label">Grok analyses</span>
+                        <span className="stat-value">
+                          {numberFormatter.format(manifestSummary.analysis_count)}
+                        </span>
+                        <span className="stat-note">
+                          Profile: {selectedProfile || '—'}
+                        </span>
+                      </div>
+                      <div className="stat-card">
+                        <span className="stat-label">Plots processed</span>
+                        <span className="stat-value">
+                          {numberFormatter.format(manifestSummary.plot_count)}
+                        </span>
+                        {manifestSummary.wikipedia_articles > 0 && (
+                          <span className="stat-note">
+                            Sources: {numberFormatter.format(manifestSummary.wikipedia_articles)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="stat-card">
+                        <span className="stat-label">Embeddings</span>
+                        <span className="stat-value">
+                          {numberFormatter.format(manifestSummary.embedding_count)}
+                        </span>
+                        <span className="stat-note">
+                          {selectedIndex === 'analysis'
+                            ? `Variant: ${activeEmbedding.name}${
+                                activeEmbedding.provider &&
+                                activeEmbedding.provider !== 'openai'
+                                  ? ` · ${activeEmbedding.provider}`
+                                  : ''
+                              }`
+                            : 'Index: plot'}
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="stat-card muted">
+                      <span className="stat-label">Manifest</span>
+                      <span className="stat-value">No summary data</span>
+                    </div>
+                  )}
                 </div>
                 <div className="detail-controls">
                   <label className="checkbox">
@@ -1141,7 +1484,7 @@ function App() {
                 <button
                   type="submit"
                   className="primary"
-                  disabled={textSearchLoading}
+                  disabled={textSearchLoading || !selectedProfile}
                 >
                   {textSearchLoading ? 'Scanning…' : 'Search text'}
                 </button>
@@ -1197,9 +1540,15 @@ function App() {
           <label className="selector">
             <span>Profile</span>
             <select
-              value={selectedProfile}
+              value={selectedProfile || ''}
               onChange={(event) => setSelectedProfile(event.target.value)}
+              disabled={!profiles.length}
             >
+              {!profiles.length && (
+                <option value="" disabled>
+                  {bootstrapLoading ? 'Loading profiles…' : 'No profiles found'}
+                </option>
+              )}
               {profiles.map((profile) => (
                 <option key={profile} value={profile}>
                   {profile}
@@ -1210,12 +1559,41 @@ function App() {
           <label className="selector">
             <span>Index</span>
             <select
-              value={selectedIndex}
+              value={selectedIndex || ''}
               onChange={(event) => setSelectedIndex(event.target.value)}
+              disabled={!indexes.length}
             >
+              {!indexes.length && (
+                <option value="" disabled>
+                  No indexes found
+                </option>
+              )}
               {indexes.map((index) => (
                 <option key={index} value={index}>
                   {index}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="selector">
+            <span>Embedding</span>
+            <select
+              value={selectedEmbeddingSet || ''}
+              onChange={(event) => setSelectedEmbeddingSet(event.target.value)}
+              disabled={
+                selectedIndex !== 'analysis' || embeddingSets.length === 0
+              }
+            >
+              {embeddingSets.length === 0 && (
+                <option value="" disabled>
+                  {selectedIndex !== 'analysis'
+                    ? 'Not used for this index'
+                    : 'No embeddings available'}
+                </option>
+              )}
+              {embeddingSets.map((embedding) => (
+                <option key={embedding.name} value={embedding.name}>
+                  {formatEmbeddingLabel(embedding)}
                 </option>
               ))}
             </select>

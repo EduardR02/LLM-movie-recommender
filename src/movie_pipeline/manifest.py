@@ -1,12 +1,14 @@
-"""SQLite-backed manifest for tracking pipeline artifacts."""
+"""SQLite-backed manifest for pipeline artifacts."""
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Literal
+from threading import RLock
+from typing import Iterable, Iterator, Literal, Sequence
 
 from .paths import PATHS
 
@@ -35,7 +37,7 @@ class AnalysisCandidate:
     title: TitleRecord
     plot_source: str | None
     plot_path: Path
-    plot_hash: str
+    plot_hash: str | None
     analysis_status: str | None
     attempts: int
 
@@ -46,6 +48,7 @@ class EmbeddingCandidate:
     analysis_path: Path
     analysis_status: str | None
     embedding_status: str | None
+    variant: str
 
 
 @dataclass
@@ -72,218 +75,113 @@ class PlotRecord:
     plot_hash: str | None
 
 
-def _row_to_title(row: tuple) -> TitleRecord:
+@dataclass
+class ManifestSummaryStats:
+    total_titles: int
+    plot_count: int
+    wikipedia_articles: int
+    analysis_count: int
+    embedding_count: int
+
+
+def _normalize_profile(value: str | None) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise ValueError("Profile value is required.")
+    return normalized
+
+
+def _normalize_variant(value: str | None) -> str:
+    return (value or "default").strip() or "default"
+
+
+def _row_to_title(row: sqlite3.Row) -> TitleRecord:
     return TitleRecord(
-        tconst=row[0],
-        primary_title=row[1],
-        original_title=row[2],
-        title_type=row[3],
-        start_year=row[4],
-        end_year=row[5],
-        runtime_minutes=row[6],
-        genres=row[7],
-        num_votes=row[8],
-        average_rating=row[9],
-        sort_rank=row[10],
+        tconst=row["tconst"],
+        primary_title=row["primary_title"],
+        original_title=row["original_title"],
+        title_type=row["title_type"],
+        start_year=row["start_year"],
+        end_year=row["end_year"],
+        runtime_minutes=row["runtime_minutes"],
+        genres=row["genres"],
+        num_votes=row["num_votes"],
+        average_rating=row["average_rating"],
+        sort_rank=row["sort_rank"],
     )
 
 
 class Manifest:
-    """Manage the pipeline manifest database."""
+    """Manage pipeline metadata and persistence."""
 
     def __init__(self, path: Path | None = None, *, profile: str | None = None) -> None:
-        normalized_profile = (profile or "default").strip()
-        self.profile = normalized_profile or "default"
+        self.profile = profile.strip() if isinstance(profile, str) else None
         self.path = path or (PATHS.state / "manifest.sqlite3")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path)
+        self._lock = RLock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.execute("PRAGMA foreign_keys = ON;")
-        self._create_tables()
+        self._conn.execute("PRAGMA journal_mode = WAL;")
+        self._conn.execute("PRAGMA synchronous = NORMAL;")
+        self._conn.row_factory = sqlite3.Row
+        self._initialize_schema()
 
     def close(self) -> None:
         self._conn.close()
 
     @contextmanager
     def cursor(self) -> Iterator[sqlite3.Cursor]:
-        cur = self._conn.cursor()
-        try:
-            yield cur
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                cur.close()
 
-    def _create_tables(self) -> None:
+    # ---------------------------------------------------------------------
+    # Schema management
+    # ---------------------------------------------------------------------
+
+    def _initialize_schema(self) -> None:
         with self.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS titles (
-                    tconst TEXT PRIMARY KEY,
-                    primary_title TEXT NOT NULL,
-                    original_title TEXT,
-                    title_type TEXT NOT NULL,
-                    start_year INTEGER,
-                    end_year INTEGER,
-                    runtime_minutes INTEGER,
-                    genres TEXT,
-                    num_votes INTEGER NOT NULL,
-                    average_rating REAL NOT NULL,
-                    sort_rank INTEGER NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_titles_updated
-                AFTER UPDATE ON titles
-                FOR EACH ROW
-                BEGIN
-                    UPDATE titles
-                    SET updated_at = CURRENT_TIMESTAMP
-                    WHERE tconst = NEW.tconst;
-                END;
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS plots (
-                    tconst TEXT PRIMARY KEY,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    source TEXT,
-                    content_hash TEXT,
-                    raw_path TEXT,
-                    clean_path TEXT,
-                    error TEXT,
-                    fetched_at TEXT,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (tconst) REFERENCES titles (tconst) ON DELETE CASCADE
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS trg_plots_updated
-                AFTER UPDATE ON plots
-                FOR EACH ROW
-                BEGIN
-                    UPDATE plots
-                    SET updated_at = CURRENT_TIMESTAMP
-                    WHERE tconst = NEW.tconst;
-                END;
-                """
-            )
-            self._ensure_analysis_table(cur)
-            self._ensure_embedding_table(cur)
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    component TEXT NOT NULL,
-                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TEXT,
-                    total_input_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_output_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_cost REAL NOT NULL DEFAULT 0.0,
-                    notes TEXT
-                );
-                """
-            )
-            self._ensure_columns(
-                cur,
-                table="sessions",
-                columns={
-                    "total_cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
-                    "total_reasoning_tokens": "INTEGER NOT NULL DEFAULT 0",
-                },
-            )
+            for statement in _CREATE_TABLE_STATEMENTS:
+                cur.execute(statement)
+            for statement in _CREATE_INDEX_STATEMENTS:
+                cur.execute(statement)
+            for statement in _TRIGGER_STATEMENTS:
+                cur.execute(statement)
 
-    def _ensure_analysis_table(self, cur: sqlite3.Cursor) -> None:
-        cur.execute(ANALYSES_CREATE_SQL_IF_NOT_EXISTS)
-        self._upgrade_table_to_profile(
-            cur,
-            table="analyses",
-            create_sql=ANALYSES_CREATE_SQL,
-            copy_columns=ANALYSES_BASE_COLUMNS,
-        )
-        cur.execute("DROP TRIGGER IF EXISTS trg_analyses_updated;")
-        cur.execute(ANALYSES_TRIGGER_SQL)
-        self._ensure_columns(
-            cur,
-            table="analyses",
-            columns={
-                "input_cached_tokens": "INTEGER",
-                "output_reasoning_tokens": "INTEGER",
-            },
-        )
-
-    def _ensure_embedding_table(self, cur: sqlite3.Cursor) -> None:
-        cur.execute(EMBEDDINGS_CREATE_SQL_IF_NOT_EXISTS)
-        self._upgrade_table_to_profile(
-            cur,
-            table="embeddings",
-            create_sql=EMBEDDINGS_CREATE_SQL,
-            copy_columns=EMBEDDINGS_BASE_COLUMNS,
-        )
-        cur.execute("DROP TRIGGER IF EXISTS trg_embeddings_updated;")
-        cur.execute(EMBEDDINGS_TRIGGER_SQL)
-
-    def _upgrade_table_to_profile(
-        self,
-        cur: sqlite3.Cursor,
-        *,
-        table: str,
-        create_sql: str,
-        copy_columns: list[str],
-    ) -> None:
-        info = cur.execute(f"PRAGMA table_info({table});").fetchall()
-        if not info:
-            cur.execute(create_sql)
-            return
-        column_names = {row[1] for row in info}
-        if "profile" in column_names:
-            return
-        cur.execute(f"ALTER TABLE {table} RENAME TO {table}_old;")
-        cur.execute(create_sql)
-        existing_columns = [row[1] for row in info]
-        copyable_columns = [col for col in copy_columns if col in existing_columns]
-        if not copyable_columns:
-            raise RuntimeError(
-                f"Cannot migrate table {table}; no overlapping columns between legacy schema and destination."
-            )
-        cols = ", ".join(copyable_columns)
-        cur.execute(
-            f"""
-            INSERT INTO {table} ({cols}, profile)
-            SELECT {cols}, 'default' FROM {table}_old;
-            """
-        )
-        cur.execute(f"DROP TABLE {table}_old;")
-
-    def _ensure_columns(
-        self,
-        cur: sqlite3.Cursor,
-        *,
-        table: str,
-        columns: dict[str, str],
-    ) -> None:
-        existing = {row[1] for row in cur.execute(f"PRAGMA table_info({table});").fetchall()}
-        for name, definition in columns.items():
-            if name not in existing:
-                cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition};")
+    # ---------------------------------------------------------------------
+    # Title management
+    # ---------------------------------------------------------------------
 
     def reset_titles(self) -> None:
-        """Clear titles table while cascading to dependents."""
         with self.cursor() as cur:
             cur.execute("DELETE FROM titles;")
 
     def bulk_insert_titles(self, records: Iterable[TitleRecord]) -> None:
-        """Insert or replace title metadata."""
+        payload: list[tuple] = [
+            (
+                r.tconst,
+                r.primary_title,
+                r.original_title,
+                r.title_type,
+                r.start_year,
+                r.end_year,
+                r.runtime_minutes,
+                r.genres,
+                r.num_votes,
+                r.average_rating,
+                r.sort_rank,
+            )
+            for r in records
+        ]
+        if not payload:
+            return
         with self.cursor() as cur:
             cur.executemany(
                 """
@@ -313,23 +211,125 @@ class Manifest:
                     average_rating=excluded.average_rating,
                     sort_rank=excluded.sort_rank;
                 """,
-                (
-                    (
-                        r.tconst,
-                        r.primary_title,
-                        r.original_title,
-                        r.title_type,
-                        r.start_year,
-                        r.end_year,
-                        r.runtime_minutes,
-                        r.genres,
-                        r.num_votes,
-                        r.average_rating,
-                        r.sort_rank,
-                    )
-                    for r in records
-                ),
+                payload,
             )
+
+    def iter_titles(self) -> Iterator[TitleRecord]:
+        query = """
+            SELECT
+                tconst,
+                primary_title,
+                original_title,
+                title_type,
+                start_year,
+                end_year,
+                runtime_minutes,
+                genres,
+                num_votes,
+                average_rating,
+                sort_rank
+            FROM titles
+            ORDER BY sort_rank ASC;
+        """
+        with self.cursor() as cur:
+            for row in cur.execute(query):
+                yield _row_to_title(row)
+
+    def iter_latest_titles(self, limit: int = 10) -> Iterator[TitleRecord]:
+        query = """
+            SELECT
+                tconst,
+                primary_title,
+                original_title,
+                title_type,
+                start_year,
+                end_year,
+                runtime_minutes,
+                genres,
+                num_votes,
+                average_rating,
+                sort_rank
+            FROM titles
+            WHERE start_year IS NOT NULL
+            ORDER BY start_year DESC, num_votes DESC, average_rating DESC
+            LIMIT ?;
+        """
+        with self.cursor() as cur:
+            for row in cur.execute(query, (limit,)):
+                yield _row_to_title(row)
+
+    def get_title(self, tconst: str) -> TitleRecord | None:
+        query = """
+            SELECT
+                tconst,
+                primary_title,
+                original_title,
+                title_type,
+                start_year,
+                end_year,
+                runtime_minutes,
+                genres,
+                num_votes,
+                average_rating,
+                sort_rank
+            FROM titles
+            WHERE tconst = ?;
+        """
+        with self.cursor() as cur:
+            row = cur.execute(query, (tconst,)).fetchone()
+        return _row_to_title(row) if row else None
+
+    def search_titles(self, term: str, limit: int = 5) -> list[TitleRecord]:
+        normalized = term.strip()
+        if not normalized:
+            return []
+        target_year: int | None = None
+        title_only = normalized
+        year_match = TITLE_WITH_YEAR_RE.match(normalized)
+        if year_match:
+            title_only = year_match.group("title").strip() or normalized
+            try:
+                target_year = int(year_match.group("year"))
+            except ValueError:
+                target_year = None
+        like_pattern = f"%{title_only}%"
+        query = """
+            SELECT
+                tconst,
+                primary_title,
+                original_title,
+                title_type,
+                start_year,
+                end_year,
+                runtime_minutes,
+                genres,
+                num_votes,
+                average_rating,
+                sort_rank
+            FROM titles
+            WHERE primary_title LIKE ?
+            ORDER BY
+                CASE LOWER(primary_title) WHEN LOWER(?) THEN 0 ELSE 1 END,
+                CASE WHEN ? IS NOT NULL AND start_year = ? THEN 0 ELSE 1 END,
+                sort_rank ASC
+            LIMIT ?;
+        """
+        with self.cursor() as cur:
+            rows = cur.execute(
+                query,
+                (
+                    like_pattern,
+                    title_only,
+                    target_year,
+                    target_year,
+                    limit,
+                ),
+            ).fetchall()
+        return [_row_to_title(row) for row in rows]
+
+    # ---------------------------------------------------------------------
+    # Plot management
+    # ---------------------------------------------------------------------
 
     def update_plot_status(
         self,
@@ -345,7 +345,16 @@ class Manifest:
         with self.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO plots (tconst, status, source, content_hash, raw_path, clean_path, error, fetched_at)
+                INSERT INTO plots (
+                    tconst,
+                    status,
+                    source,
+                    content_hash,
+                    raw_path,
+                    clean_path,
+                    error,
+                    fetched_at
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(tconst) DO UPDATE SET
                     status=excluded.status,
@@ -360,25 +369,27 @@ class Manifest:
             )
 
     def get_plot_record(self, tconst: str) -> PlotRecord | None:
+        query = """
+            SELECT status, source, raw_path, clean_path, error, content_hash
+            FROM plots
+            WHERE tconst = ?;
+        """
         with self.cursor() as cur:
-            row = cur.execute(
-                """
-                SELECT status, source, raw_path, clean_path, error, content_hash
-                FROM plots
-                WHERE tconst = ?
-                """,
-                (tconst,),
-            ).fetchone()
+            row = cur.execute(query, (tconst,)).fetchone()
         if not row:
             return None
         return PlotRecord(
-            status=row[0],
-            source=row[1],
-            raw_path=row[2],
-            clean_path=row[3],
-            error=row[4],
-            plot_hash=row[5],
+            status=row["status"],
+            source=row["source"],
+            raw_path=row["raw_path"],
+            clean_path=row["clean_path"],
+            error=row["error"],
+            plot_hash=row["content_hash"],
         )
+
+    # ---------------------------------------------------------------------
+    # Analysis tracking
+    # ---------------------------------------------------------------------
 
     def update_analysis_status(
         self,
@@ -399,7 +410,7 @@ class Manifest:
         output_path: str | None = None,
         error: str | None = None,
     ) -> None:
-        active_profile = (profile or self.profile or "default").strip() or "default"
+        active_profile = _normalize_profile(profile or self.profile)
         with self.cursor() as cur:
             cur.execute(
                 """
@@ -457,27 +468,209 @@ class Manifest:
                 ),
             )
 
+    def ensure_analysis_record(
+        self,
+        record: TitleRecord,
+        *,
+        profile: str,
+        plot_hash: str | None,
+        path: Path,
+        model: str,
+    ) -> None:
+        active_profile = _normalize_profile(profile)
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO analyses (
+                    tconst,
+                    profile,
+                    status,
+                    session_id,
+                    model,
+                    system_prompt_hash,
+                    plot_hash,
+                    attempts,
+                    input_tokens,
+                    output_tokens,
+                    cost_estimate,
+                    output_path,
+                    error
+                ) VALUES (?, ?, 'ok', ?, ?, NULL, ?, 1, NULL, NULL, NULL, ?, NULL)
+                ON CONFLICT(tconst, profile) DO UPDATE SET
+                    status='ok',
+                    model=excluded.model,
+                    plot_hash=COALESCE(excluded.plot_hash, analyses.plot_hash),
+                    output_path=excluded.output_path,
+                    error=NULL,
+                    attempts=COALESCE(analyses.attempts, 0)+1;
+                """,
+                (
+                    record.tconst,
+                    active_profile,
+                    "manual-import",
+                    model,
+                    plot_hash,
+                    str(path),
+                ),
+            )
+
+    def iter_analysis_tconsts(
+        self,
+        statuses: Sequence[str] | None = None,
+        *,
+        profile: str | None = None,
+    ) -> Iterator[str]:
+        active_profile = _normalize_profile(profile or self.profile)
+        query = "SELECT tconst FROM analyses WHERE profile = ?"
+        params: list[object] = [active_profile]
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            query = f"{query} AND status IN ({placeholders})"
+            params.extend(statuses)
+        with self.cursor() as cur:
+            for row in cur.execute(query, params):
+                yield row["tconst"]
+
+    def reset_analysis(self, tconst: str, *, profile: str | None = None) -> None:
+        active_profile = _normalize_profile(profile or self.profile)
+        with self.cursor() as cur:
+            plot_row = cur.execute(
+                "SELECT content_hash FROM plots WHERE tconst = ?",
+                (tconst,),
+            ).fetchone()
+            plot_hash = plot_row["content_hash"] if plot_row else None
+            exists = cur.execute(
+                "SELECT 1 FROM analyses WHERE tconst = ? AND profile = ?",
+                (tconst, active_profile),
+            ).fetchone()
+            if exists:
+                cur.execute(
+                    """
+                    UPDATE analyses
+                    SET status='queued',
+                        session_id=NULL,
+                        model=NULL,
+                        system_prompt_hash=NULL,
+                        plot_hash=?,
+                        attempts=0,
+                        input_tokens=NULL,
+                        input_cached_tokens=NULL,
+                        output_tokens=NULL,
+                        output_reasoning_tokens=NULL,
+                        cost_estimate=NULL,
+                        output_path=NULL,
+                        error=NULL
+                    WHERE tconst=? AND profile=?;
+                    """,
+                    (plot_hash, tconst, active_profile),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO analyses (
+                        tconst,
+                        profile,
+                        status,
+                        session_id,
+                        model,
+                        system_prompt_hash,
+                        plot_hash,
+                        attempts,
+                        input_tokens,
+                        input_cached_tokens,
+                        output_tokens,
+                        output_reasoning_tokens,
+                        cost_estimate,
+                        output_path,
+                        error
+                    ) VALUES (?, ?, 'queued', NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                    """,
+                    (tconst, active_profile, plot_hash),
+                )
+
+    def iter_analysis_candidates(
+        self,
+        limit: int | None = None,
+        *,
+        include_completed: bool = False,
+        profile: str | None = None,
+    ) -> Iterator[AnalysisCandidate]:
+        active_profile = _normalize_profile(profile or self.profile)
+        query = """
+            SELECT
+                t.tconst,
+                t.primary_title,
+                t.original_title,
+                t.title_type,
+                t.start_year,
+                t.end_year,
+                t.runtime_minutes,
+                t.genres,
+                t.num_votes,
+                t.average_rating,
+                t.sort_rank,
+                p.source,
+                p.clean_path,
+                p.content_hash,
+                COALESCE(a.status, '') AS analysis_status,
+                COALESCE(a.attempts, 0) AS attempts
+            FROM titles AS t
+            JOIN plots AS p ON p.tconst = t.tconst AND p.status = 'ok'
+            LEFT JOIN analyses AS a ON a.tconst = t.tconst AND a.profile = ?
+        """
+        params: list[object] = [active_profile]
+        conditions: list[str] = []
+        if not include_completed:
+            conditions.append("COALESCE(a.status, '') != 'ok'")
+        if conditions:
+            query = f"{query} WHERE {' AND '.join(conditions)}"
+        query = f"{query} ORDER BY t.sort_rank ASC"
+        if limit is not None:
+            query = f"{query} LIMIT ?"
+            params.append(int(limit))
+
+        with self.cursor() as cur:
+            for row in cur.execute(query, params):
+                title = _row_to_title(row)
+                yield AnalysisCandidate(
+                    title=title,
+                    plot_source=row["source"],
+                    plot_path=Path(row["clean_path"]),
+                    plot_hash=row["content_hash"],
+                    analysis_status=row["analysis_status"] or None,
+                    attempts=row["attempts"],
+                )
+
+    # ---------------------------------------------------------------------
+    # Embedding tracking
+    # ---------------------------------------------------------------------
+
     def update_embedding_status(
         self,
         tconst: str,
         status: EmbeddingStatus,
         *,
         profile: str | None = None,
+        variant: str | None = None,
         session_id: str | None = None,
         model: str | None = None,
         prompt_hash: str | None = None,
         dim: int | None = None,
         input_tokens: int | None = None,
         vector_path: str | None = None,
+        provider: str | None = None,
         error: str | None = None,
     ) -> None:
-        active_profile = (profile or self.profile or "default").strip() or "default"
+        active_profile = _normalize_profile(profile or self.profile)
+        active_variant = _normalize_variant(variant)
         with self.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO embeddings (
                     tconst,
                     profile,
+                    variant,
+                    provider,
                     status,
                     session_id,
                     model,
@@ -486,9 +679,11 @@ class Manifest:
                     input_tokens,
                     vector_path,
                     error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tconst, profile) DO UPDATE SET
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tconst, profile, variant) DO UPDATE SET
                     status=excluded.status,
+                    provider=COALESCE(NULLIF(excluded.provider, ''), embeddings.provider),
                     session_id=COALESCE(excluded.session_id, embeddings.session_id),
                     model=COALESCE(excluded.model, embeddings.model),
                     prompt_hash=COALESCE(excluded.prompt_hash, embeddings.prompt_hash),
@@ -500,6 +695,8 @@ class Manifest:
                 (
                     tconst,
                     active_profile,
+                    active_variant,
+                    provider or "openai",
                     status,
                     session_id,
                     model,
@@ -510,6 +707,101 @@ class Manifest:
                     error,
                 ),
             )
+
+    def iter_embedding_candidates(
+        self,
+        limit: int | None = None,
+        *,
+        include_completed: bool = False,
+        profile: str | None = None,
+        variant: str | None = None,
+    ) -> Iterator[EmbeddingCandidate]:
+        active_profile = _normalize_profile(profile or self.profile)
+        active_variant = _normalize_variant(variant)
+        query = """
+            SELECT
+                t.tconst,
+                t.primary_title,
+                t.original_title,
+                t.title_type,
+                t.start_year,
+                t.end_year,
+                t.runtime_minutes,
+                t.genres,
+                t.num_votes,
+                t.average_rating,
+                t.sort_rank,
+                a.output_path,
+                a.status AS analysis_status,
+                COALESCE(e.status, '') AS embedding_status,
+                COALESCE(e.variant, ?) AS resolved_variant
+            FROM titles AS t
+            JOIN analyses AS a ON a.tconst = t.tconst AND a.profile = ? AND a.status = 'ok'
+            LEFT JOIN embeddings AS e
+                ON e.tconst = t.tconst AND e.profile = ? AND e.variant = ?
+        """
+        params: list[object] = [active_variant, active_profile, active_profile, active_variant]
+        conditions: list[str] = []
+        if not include_completed:
+            conditions.append("COALESCE(e.status, '') != 'ok'")
+        if conditions:
+            query = f"{query} WHERE {' AND '.join(conditions)}"
+        query = f"{query} ORDER BY t.sort_rank ASC"
+        if limit is not None:
+            query = f"{query} LIMIT ?"
+            params.append(int(limit))
+
+        with self.cursor() as cur:
+            for row in cur.execute(query, params):
+                analysis_path = row["output_path"]
+                if not analysis_path:
+                    continue
+                title = _row_to_title(row)
+                yield EmbeddingCandidate(
+                    title=title,
+                    analysis_path=Path(analysis_path),
+                    analysis_status=row["analysis_status"] or None,
+                    embedding_status=row["embedding_status"] or None,
+                    variant=row["resolved_variant"],
+                )
+
+    def list_embedding_variants(self, *, profile: str | None = None) -> list[dict[str, object]]:
+        active_profile = _normalize_profile(profile or self.profile)
+        query = """
+            SELECT
+                variant,
+                MAX(COALESCE(NULLIF(provider, ''), 'openai')) AS provider,
+                MAX(NULLIF(model, '')) AS model,
+                MAX(COALESCE(dim, 0)) AS dim,
+                COUNT(*) AS vector_count,
+                MAX(updated_at) AS updated_at
+            FROM embeddings
+            WHERE profile = ? AND status = 'ok'
+            GROUP BY variant;
+        """
+        variants: list[dict[str, object]] = []
+        with self.cursor() as cur:
+            for row in cur.execute(query, (active_profile,)):
+                name = (row["variant"] or "").strip()
+                if not name:
+                    # Skip rows that do not specify a variant; callers should normalise these.
+                    continue
+                variants.append(
+                    {
+                        "name": name,
+                        "provider": row["provider"] or "openai",
+                        "model": row["model"],
+                        "dimension": int(row["dim"] or 0) or None,
+                        "vector_count": int(row["vector_count"] or 0),
+                        "updated_at": row["updated_at"],
+                    }
+                )
+        variants.sort(key=lambda item: item["name"])
+        return variants
+
+    # ---------------------------------------------------------------------
+    # Sessions and reporting
+    # ---------------------------------------------------------------------
 
     def register_session(self, session_id: str, component: str) -> None:
         with self.cursor() as cur:
@@ -557,323 +849,6 @@ class Manifest:
                 ),
             )
 
-    def iter_titles(self) -> Iterator[TitleRecord]:
-        with self.cursor() as cur:
-            for row in cur.execute(
-                """
-                SELECT
-                    tconst,
-                    primary_title,
-                    original_title,
-                    title_type,
-                    start_year,
-                    end_year,
-                    runtime_minutes,
-                    genres,
-                    num_votes,
-                    average_rating,
-                    sort_rank
-                FROM titles
-                ORDER BY sort_rank ASC;
-                """
-            ):
-                yield _row_to_title(row)
-
-    def ensure_analysis_record(
-        self,
-        record: TitleRecord,
-        *,
-        profile: str,
-        plot_hash: str | None,
-        path: Path,
-        model: str,
-    ) -> None:
-        with self.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO analyses (
-                    tconst,
-                    profile,
-                    status,
-                    session_id,
-                    model,
-                    system_prompt_hash,
-                    plot_hash,
-                    attempts,
-                    input_tokens,
-                    output_tokens,
-                    cost_estimate,
-                    output_path,
-                    error
-                ) VALUES (?, ?, 'ok', ?, ?, NULL, ?, 1, NULL, NULL, NULL, ?, NULL)
-                ON CONFLICT(tconst, profile) DO UPDATE SET
-                    status='ok',
-                    model=excluded.model,
-                    plot_hash=COALESCE(excluded.plot_hash, analyses.plot_hash),
-                    output_path=excluded.output_path,
-                    error=NULL,
-                    attempts=COALESCE(analyses.attempts, 0)+1
-                """,
-                (
-                    record.tconst,
-                    profile,
-                    "manual-import",
-                    model,
-                    plot_hash,
-                    str(path),
-                ),
-            )
-    def get_title(self, tconst: str) -> TitleRecord | None:
-        with self.cursor() as cur:
-            row = cur.execute(
-                """
-                SELECT
-                    tconst,
-                    primary_title,
-                    original_title,
-                    title_type,
-                    start_year,
-                    end_year,
-                    runtime_minutes,
-                    genres,
-                    num_votes,
-                    average_rating,
-                    sort_rank
-                FROM titles
-                WHERE tconst = ?
-                """,
-                (tconst,),
-            ).fetchone()
-        if not row:
-            return None
-        return _row_to_title(row)
-
-    def search_titles(self, term: str, limit: int = 5) -> list[TitleRecord]:
-        """Return titles whose names match the search term."""
-        like_pattern = f"%{term.strip()}%"
-        query = """
-            SELECT
-                tconst,
-                primary_title,
-                original_title,
-                title_type,
-                start_year,
-                end_year,
-                runtime_minutes,
-                genres,
-                num_votes,
-                average_rating,
-                sort_rank
-            FROM titles
-            WHERE primary_title LIKE ?
-            ORDER BY
-                CASE LOWER(primary_title) WHEN LOWER(?) THEN 0 ELSE 1 END,
-                sort_rank ASC
-            LIMIT ?
-        """
-        with self.cursor() as cur:
-            rows = cur.execute(query, (like_pattern, term.strip(), limit)).fetchall()
-        return [_row_to_title(row) for row in rows]
-
-    def iter_analysis_tconsts(
-        self,
-        statuses: tuple[str, ...] | None = None,
-        *,
-        profile: str | None = None,
-    ) -> Iterator[str]:
-        """Yield tconst values from the analyses table filtered by status."""
-        active_profile = (profile or self.profile or "default").strip() or "default"
-        query = "SELECT tconst FROM analyses WHERE profile = ?"
-        params: list[str] = [active_profile]
-        if statuses:
-            placeholders = ",".join("?" for _ in statuses)
-            query = f"{query} AND status IN ({placeholders})"
-            params.extend(statuses)
-        with self.cursor() as cur:
-            for row in cur.execute(query, params):
-                yield row[0]
-
-    def reset_analysis(self, tconst: str, *, profile: str | None = None) -> None:
-        """Reset analysis status and metadata for a title."""
-        active_profile = (profile or self.profile or "default").strip() or "default"
-        with self.cursor() as cur:
-            row = cur.execute(
-                "SELECT 1 FROM analyses WHERE tconst = ? AND profile = ?", (tconst, active_profile)
-            ).fetchone()
-            plot_hash_row = cur.execute(
-                "SELECT content_hash FROM plots WHERE tconst = ?", (tconst,)
-            ).fetchone()
-            plot_hash = plot_hash_row[0] if plot_hash_row else None
-            if row:
-                cur.execute(
-                    """
-                    UPDATE analyses
-                    SET status = 'queued',
-                        session_id = NULL,
-                        model = NULL,
-                        system_prompt_hash = NULL,
-                        plot_hash = ?,
-                        attempts = 0,
-                        input_tokens = NULL,
-                        input_cached_tokens = NULL,
-                        output_tokens = NULL,
-                        output_reasoning_tokens = NULL,
-                        cost_estimate = NULL,
-                        output_path = NULL,
-                        error = NULL
-                    WHERE tconst = ? AND profile = ?
-                    """,
-                    (plot_hash, tconst, active_profile),
-                )
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO analyses (
-                        tconst,
-                        profile,
-                        status,
-                        session_id,
-                        model,
-                        system_prompt_hash,
-                        plot_hash,
-                        attempts,
-                        input_tokens,
-                        input_cached_tokens,
-                        output_tokens,
-                        output_reasoning_tokens,
-                        cost_estimate,
-                        output_path,
-                        error
-                    ) VALUES (?, ?, 'queued', NULL, NULL, NULL, ?, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
-                    """,
-                    (tconst, active_profile, plot_hash),
-                )
-
-    def iter_analysis_candidates(
-        self,
-        limit: int | None = None,
-        *,
-        include_completed: bool = False,
-        profile: str | None = None,
-    ) -> Iterator[AnalysisCandidate]:
-        active_profile = (profile or self.profile or "default").strip() or "default"
-        base_query = """
-            SELECT
-                t.tconst,
-                t.primary_title,
-                t.original_title,
-                t.title_type,
-                t.start_year,
-                t.end_year,
-                t.runtime_minutes,
-                t.genres,
-                t.num_votes,
-                t.average_rating,
-                t.sort_rank,
-                p.source,
-                p.clean_path,
-                p.content_hash,
-                COALESCE(a.status, ''),
-                COALESCE(a.attempts, 0)
-            FROM titles AS t
-            JOIN plots AS p ON p.tconst = t.tconst AND p.status = 'ok'
-            LEFT JOIN analyses AS a ON a.tconst = t.tconst AND a.profile = ?
-        """
-        params: list[object] = [active_profile]
-        conditions: list[str] = []
-        if not include_completed:
-            conditions.append("COALESCE(a.status, '') != 'ok'")
-        if conditions:
-            base_query = f"{base_query} WHERE {' AND '.join(conditions)}"
-        base_query = f"{base_query} ORDER BY t.sort_rank ASC"
-        if limit is not None:
-            base_query = f"{base_query} LIMIT ?"
-            params.append(int(limit))
-        with self.cursor() as cur:
-            for row in cur.execute(base_query, params):
-                title = TitleRecord(
-                    tconst=row[0],
-                    primary_title=row[1],
-                    original_title=row[2],
-                    title_type=row[3],
-                    start_year=row[4],
-                    end_year=row[5],
-                    runtime_minutes=row[6],
-                    genres=row[7],
-                    num_votes=row[8],
-                    average_rating=row[9],
-                    sort_rank=row[10],
-                )
-                yield AnalysisCandidate(
-                    title=title,
-                    plot_source=row[11],
-                    plot_path=Path(row[12]),
-                    plot_hash=row[13],
-                    analysis_status=row[14] or None,
-                    attempts=row[15],
-                )
-
-    def iter_embedding_candidates(
-        self,
-        limit: int | None = None,
-        *,
-        include_completed: bool = False,
-        profile: str | None = None,
-    ) -> Iterator[EmbeddingCandidate]:
-        active_profile = (profile or self.profile or "default").strip() or "default"
-        query = """
-            SELECT
-                t.tconst,
-                t.primary_title,
-                t.original_title,
-                t.title_type,
-                t.start_year,
-                t.end_year,
-                t.runtime_minutes,
-                t.genres,
-                t.num_votes,
-                t.average_rating,
-                t.sort_rank,
-                a.output_path,
-                a.status,
-                COALESCE(e.status, '')
-            FROM titles AS t
-            JOIN analyses AS a ON a.tconst = t.tconst AND a.status = 'ok' AND a.profile = ?
-            LEFT JOIN embeddings AS e ON e.tconst = t.tconst AND e.profile = ?
-        """
-        params: list[object] = [active_profile, active_profile]
-        conditions: list[str] = []
-        if not include_completed:
-            conditions.append("COALESCE(e.status, '') != 'ok'")
-        if conditions:
-            query = f"{query} WHERE {' AND '.join(conditions)}"
-        query = f"{query} ORDER BY t.sort_rank ASC"
-        if limit is not None:
-            query = f"{query} LIMIT ?"
-            params.append(int(limit))
-        with self.cursor() as cur:
-            for row in cur.execute(query, params):
-                title = TitleRecord(
-                    tconst=row[0],
-                    primary_title=row[1],
-                    original_title=row[2],
-                    title_type=row[3],
-                    start_year=row[4],
-                    end_year=row[5],
-                    runtime_minutes=row[6],
-                    genres=row[7],
-                    num_votes=row[8],
-                    average_rating=row[9],
-                    sort_rank=row[10],
-                )
-                output_path = Path(row[11])
-                yield EmbeddingCandidate(
-                    title=title,
-                    analysis_path=output_path,
-                    analysis_status=row[12] or None,
-                    embedding_status=(row[13] or None),
-                )
-
     def iter_sessions(self, limit: int = 10) -> Iterator[SessionRecord]:
         query = """
             SELECT
@@ -881,168 +856,228 @@ class Manifest:
                 component,
                 started_at,
                 completed_at,
-                COALESCE(total_input_tokens, 0),
-                COALESCE(total_cached_input_tokens, 0),
-                COALESCE(total_output_tokens, 0),
-                COALESCE(total_reasoning_tokens, 0),
-                total_cost,
+                COALESCE(total_input_tokens, 0) AS total_input_tokens,
+                COALESCE(total_cached_input_tokens, 0) AS total_cached_input_tokens,
+                COALESCE(total_output_tokens, 0) AS total_output_tokens,
+                COALESCE(total_reasoning_tokens, 0) AS total_reasoning_tokens,
+                COALESCE(total_cost, 0.0) AS total_cost,
                 notes
             FROM sessions
             ORDER BY started_at DESC
-            LIMIT ?
+            LIMIT ?;
         """
         with self.cursor() as cur:
             for row in cur.execute(query, (limit,)):
                 yield SessionRecord(
-                    id=row[0],
-                    component=row[1],
-                    started_at=row[2],
-                    completed_at=row[3],
-                    total_input_tokens=row[4],
-                    total_cached_input_tokens=row[5],
-                    total_output_tokens=row[6],
-                    total_reasoning_tokens=row[7],
-                    total_cost=row[8],
-                    notes=row[9],
+                    id=row["id"],
+                    component=row["component"],
+                    started_at=row["started_at"],
+                    completed_at=row["completed_at"],
+                    total_input_tokens=row["total_input_tokens"],
+                    total_cached_input_tokens=row["total_cached_input_tokens"],
+                    total_output_tokens=row["total_output_tokens"],
+                    total_reasoning_tokens=row["total_reasoning_tokens"],
+                    total_cost=row["total_cost"],
+                    notes=row["notes"],
                 )
 
     def session_totals(self) -> list[tuple[str, int, int, int, int, float]]:
-        """Return aggregated token/cost totals per component."""
         query = """
             SELECT
                 component,
-                COALESCE(SUM(total_input_tokens), 0),
-                COALESCE(SUM(total_cached_input_tokens), 0),
-                COALESCE(SUM(total_output_tokens), 0),
-                COALESCE(SUM(total_reasoning_tokens), 0),
-                COALESCE(SUM(total_cost), 0.0)
+                COALESCE(SUM(total_input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(total_cached_input_tokens), 0) AS total_cached_input_tokens,
+                COALESCE(SUM(total_output_tokens), 0) AS total_output_tokens,
+                COALESCE(SUM(total_reasoning_tokens), 0) AS total_reasoning_tokens,
+                COALESCE(SUM(total_cost), 0.0) AS total_cost
             FROM sessions
             GROUP BY component
-            ORDER BY component ASC
+            ORDER BY component ASC;
         """
         with self.cursor() as cur:
             return [tuple(row) for row in cur.execute(query)]
 
-    def iter_latest_titles(self, limit: int = 10) -> Iterator[TitleRecord]:
-        query = """
-            SELECT
-                tconst,
-                primary_title,
-                original_title,
-                title_type,
-                start_year,
-                end_year,
-                runtime_minutes,
-                genres,
-                num_votes,
-                average_rating,
-                sort_rank
-            FROM titles
-            WHERE start_year IS NOT NULL
-            ORDER BY start_year DESC, num_votes DESC, average_rating DESC
-            LIMIT ?
-        """
+    def summary_stats(
+        self,
+        *,
+        profile: str | None = None,
+        variant: str | None = None,
+    ) -> ManifestSummaryStats:
+        active_profile = _normalize_profile(profile or self.profile)
+        active_variant = _normalize_variant(variant)
         with self.cursor() as cur:
-            for row in cur.execute(query, (limit,)):
-                yield _row_to_title(row)
-ANALYSES_BASE_COLUMNS = [
-    "tconst",
-    "status",
-    "session_id",
-    "model",
-    "system_prompt_hash",
-    "plot_hash",
-    "attempts",
-    "input_tokens",
-    "input_cached_tokens",
-    "output_tokens",
-    "output_reasoning_tokens",
-    "cost_estimate",
-    "output_path",
-    "error",
-    "updated_at",
-]
+            total_titles = cur.execute("SELECT COUNT(*) AS count FROM titles;").fetchone()["count"]
+            plots_row = cur.execute(
+                """
+                SELECT COUNT(*) AS ok_plots, COUNT(DISTINCT source) AS sources
+                FROM plots
+                WHERE status = 'ok';
+                """
+            ).fetchone()
+            analyses_row = cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM analyses
+                WHERE profile = ? AND status = 'ok';
+                """,
+                (active_profile,),
+            ).fetchone()
+            embeddings_row = cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM embeddings
+                WHERE profile = ? AND variant = ? AND status = 'ok';
+                """,
+                (active_profile, active_variant),
+            ).fetchone()
+        return ManifestSummaryStats(
+            total_titles=int(total_titles or 0),
+            plot_count=int(plots_row["ok_plots"] or 0),
+            wikipedia_articles=int(plots_row["sources"] or 0),
+            analysis_count=int(analyses_row["count"] or 0),
+            embedding_count=int(embeddings_row["count"] or 0),
+        )
 
-ANALYSES_CREATE_SQL = """
-CREATE TABLE analyses (
-    tconst TEXT NOT NULL,
-    profile TEXT NOT NULL DEFAULT 'default',
-    status TEXT NOT NULL DEFAULT 'queued',
-    session_id TEXT,
-    model TEXT,
-    system_prompt_hash TEXT,
-    plot_hash TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    input_tokens INTEGER,
-    input_cached_tokens INTEGER,
-    output_tokens INTEGER,
-    output_reasoning_tokens INTEGER,
-    cost_estimate REAL,
-    output_path TEXT,
-    error TEXT,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (tconst, profile),
-    FOREIGN KEY (tconst) REFERENCES titles (tconst) ON DELETE CASCADE
-);
-"""
 
-ANALYSES_CREATE_SQL_IF_NOT_EXISTS = ANALYSES_CREATE_SQL.replace(
-    "CREATE TABLE analyses", "CREATE TABLE IF NOT EXISTS analyses"
+# -------------------------------------------------------------------------
+# Schema definitions
+# -------------------------------------------------------------------------
+
+_CREATE_TABLE_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS titles (
+        tconst TEXT PRIMARY KEY,
+        primary_title TEXT NOT NULL,
+        original_title TEXT,
+        title_type TEXT NOT NULL,
+        start_year INTEGER,
+        end_year INTEGER,
+        runtime_minutes INTEGER,
+        genres TEXT,
+        num_votes INTEGER NOT NULL,
+        average_rating REAL NOT NULL,
+        sort_rank INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS plots (
+        tconst TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'queued',
+        source TEXT,
+        content_hash TEXT,
+        raw_path TEXT,
+        clean_path TEXT,
+        error TEXT,
+        fetched_at TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (tconst) REFERENCES titles (tconst) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS analyses (
+        tconst TEXT NOT NULL,
+        profile TEXT NOT NULL DEFAULT 'default',
+        status TEXT NOT NULL DEFAULT 'queued',
+        session_id TEXT,
+        model TEXT,
+        system_prompt_hash TEXT,
+        plot_hash TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        input_tokens INTEGER,
+        input_cached_tokens INTEGER,
+        output_tokens INTEGER,
+        output_reasoning_tokens INTEGER,
+        cost_estimate REAL,
+        output_path TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (tconst, profile),
+        FOREIGN KEY (tconst) REFERENCES titles (tconst) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS embeddings (
+        tconst TEXT NOT NULL,
+        profile TEXT NOT NULL DEFAULT 'default',
+        variant TEXT NOT NULL DEFAULT 'default',
+        provider TEXT NOT NULL DEFAULT 'openai',
+        status TEXT NOT NULL DEFAULT 'queued',
+        session_id TEXT,
+        model TEXT,
+        prompt_hash TEXT,
+        dim INTEGER,
+        input_tokens INTEGER,
+        vector_path TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (tconst, profile, variant),
+        FOREIGN KEY (tconst) REFERENCES titles (tconst) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        component TEXT NOT NULL,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT,
+        total_input_tokens INTEGER NOT NULL DEFAULT 0,
+        total_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+        total_output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        total_cost REAL NOT NULL DEFAULT 0.0,
+        notes TEXT
+    );
+    """,
 )
 
-ANALYSES_TRIGGER_SQL = """
-CREATE TRIGGER IF NOT EXISTS trg_analyses_updated
-AFTER UPDATE ON analyses
-FOR EACH ROW
-BEGIN
-    UPDATE analyses
-    SET updated_at = CURRENT_TIMESTAMP
-    WHERE tconst = NEW.tconst AND profile = NEW.profile;
-END;
-"""
-
-EMBEDDINGS_BASE_COLUMNS = [
-    "tconst",
-    "status",
-    "session_id",
-    "model",
-    "prompt_hash",
-    "dim",
-    "input_tokens",
-    "vector_path",
-    "error",
-    "updated_at",
-]
-
-EMBEDDINGS_CREATE_SQL = """
-CREATE TABLE embeddings (
-    tconst TEXT NOT NULL,
-    profile TEXT NOT NULL DEFAULT 'default',
-    status TEXT NOT NULL DEFAULT 'queued',
-    session_id TEXT,
-    model TEXT,
-    prompt_hash TEXT,
-    dim INTEGER,
-    input_tokens INTEGER,
-    vector_path TEXT,
-    error TEXT,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (tconst, profile),
-    FOREIGN KEY (tconst) REFERENCES titles (tconst) ON DELETE CASCADE
-);
-"""
-
-EMBEDDINGS_CREATE_SQL_IF_NOT_EXISTS = EMBEDDINGS_CREATE_SQL.replace(
-    "CREATE TABLE embeddings", "CREATE TABLE IF NOT EXISTS embeddings"
+_CREATE_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_plots_status ON plots(status);",
+    "CREATE INDEX IF NOT EXISTS idx_analyses_profile_status ON analyses(profile, status);",
+    "CREATE INDEX IF NOT EXISTS idx_embeddings_profile_variant ON embeddings(profile, variant, status);",
 )
 
-EMBEDDINGS_TRIGGER_SQL = """
-CREATE TRIGGER IF NOT EXISTS trg_embeddings_updated
-AFTER UPDATE ON embeddings
-FOR EACH ROW
-BEGIN
-    UPDATE embeddings
-    SET updated_at = CURRENT_TIMESTAMP
-    WHERE tconst = NEW.tconst AND profile = NEW.profile;
-END;
-"""
+_TRIGGER_STATEMENTS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_titles_updated
+    AFTER UPDATE ON titles
+    FOR EACH ROW
+    BEGIN
+        UPDATE titles
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE tconst = NEW.tconst;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_plots_updated
+    AFTER UPDATE ON plots
+    FOR EACH ROW
+    BEGIN
+        UPDATE plots
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE tconst = NEW.tconst;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_analyses_updated
+    AFTER UPDATE ON analyses
+    FOR EACH ROW
+    BEGIN
+        UPDATE analyses
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE tconst = NEW.tconst AND profile = NEW.profile;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_embeddings_updated
+    AFTER UPDATE ON embeddings
+    FOR EACH ROW
+    BEGIN
+        UPDATE embeddings
+        SET updated_at = CURRENT_TIMESTAMP
+        WHERE tconst = NEW.tconst AND profile = NEW.profile AND variant = NEW.variant;
+    END;
+    """,
+)
+TITLE_WITH_YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)$")
