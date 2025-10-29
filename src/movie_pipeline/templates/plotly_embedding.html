@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{PAGE_TITLE}}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 0 1.5rem 2rem;
+      background: #0e1117;
+      color: #f5f6fa;
+    }
+    header {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      padding: 1.25rem 0 0.5rem;
+    }
+    h1 {
+      font-size: 1.1rem;
+      margin: 0;
+      letter-spacing: 0.02em;
+    }
+    .search-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .search-controls {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .search-bar input {
+      min-width: 260px;
+      padding: 0.45rem 0.65rem;
+      border-radius: 6px;
+      border: 1px solid #2a2f3a;
+      background: #161b22;
+      color: inherit;
+    }
+    .search-bar button {
+      padding: 0.45rem 0.9rem;
+      border-radius: 6px;
+      border: none;
+      background: #2a7ade;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .search-bar button:hover {
+      background: #4793f3;
+    }
+    .search-status {
+      min-height: 1.3rem;
+      font-size: 0.9rem;
+      opacity: 0.85;
+    }
+    .plot-wrapper {
+      margin-top: 0.5rem;
+      border: 1px solid #1f232c;
+      border-radius: 12px;
+      background: #11141a;
+      padding: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{{PAGE_TITLE}}</h1>
+    <div class="search-bar">
+      <div class="search-controls">
+        <input id="plot-search-input" type="text" placeholder="Find a title (e.g., Blade Runner)" />
+        <button id="plot-search-button" type="button">Search</button>
+      </div>
+      <span id="plot-search-status" class="search-status"></span>
+    </div>
+  </header>
+
+  <div class="plot-wrapper">
+    <div id="{{DIV_ID}}"></div>
+  </div>
+
+  <script>
+    const FIGURE_SPEC = JSON.parse({{FIGURE_JSON}});
+    const PLOT_CONFIG = {{CONFIG_JSON}};
+    const SEARCH_DATA = {{SEARCH_DATA}};
+    const PLOT_DIV_ID = "{{DIV_ID}}";
+    const PLOT_SELECTION = {{SELECTION_INFO}};
+
+    const plotDiv = document.getElementById(PLOT_DIV_ID);
+    Plotly.newPlot(plotDiv, FIGURE_SPEC.data, FIGURE_SPEC.layout, PLOT_CONFIG).then(() => {
+      const input = document.getElementById("plot-search-input");
+      const button = document.getElementById("plot-search-button");
+      const status = document.getElementById("plot-search-status");
+      const ratingTraceIndex = PLOT_SELECTION?.rating_trace ?? 0;
+      const highlightTraceIndex = PLOT_SELECTION?.highlight_trace ?? plotDiv.data.length - 1;
+      const genreHighlightTraceIndex =
+        PLOT_SELECTION?.genre_highlight_trace ?? plotDiv.data.length - 1;
+
+      const flashStatus = (message, isError = false) => {
+        status.textContent = message;
+        status.style.color = isError ? "#ff7675" : "#8ddc8d";
+        if (message) {
+          setTimeout(() => {
+            status.textContent = "";
+          }, 2200);
+        }
+      };
+
+      const focusPoint = ({ hoverText, titleLabel, x, y }) => {
+        if (typeof x !== "number" || typeof y !== "number") {
+          flashStatus("Point coordinates unavailable", true);
+          return;
+        }
+        const highlightUpdate = Plotly.restyle(
+          plotDiv,
+          {
+            x: [[x]],
+            y: [[y]],
+            text: [[titleLabel]],
+            hovertext: [[hoverText]],
+          },
+          [highlightTraceIndex]
+        );
+        const genreHighlightUpdate = Plotly.restyle(
+          plotDiv,
+          {
+            x: [[x]],
+            y: [[y]],
+          },
+          [genreHighlightTraceIndex]
+        );
+        Promise.all([highlightUpdate, genreHighlightUpdate]).then(() => {
+          Plotly.relayout(plotDiv, {
+            annotations: [
+              {
+                x,
+                y,
+                xref: "x",
+                yref: "y",
+                text: hoverText,
+                showarrow: true,
+                arrowcolor: "#ffd166",
+                arrowhead: 4,
+                ax: 0,
+                ay: -50,
+                bgcolor: "rgba(14,17,23,0.92)",
+                font: { color: "#ffd166", size: 12 },
+                bordercolor: "#ffd166",
+                borderpad: 6,
+                align: "left",
+              },
+            ],
+          });
+        });
+      };
+
+      const runSearch = () => {
+        const query = input.value.trim().toLowerCase();
+        if (!query) {
+          flashStatus("Enter a title to search", true);
+          return;
+        }
+        const match = SEARCH_DATA.find((item) => item.lower.includes(query));
+        if (!match) {
+          flashStatus(`No match for “${input.value}”`, true);
+          return;
+        }
+        focusPoint({
+          hoverText: match.hover,
+          titleLabel: match.title,
+          x: match.x,
+          y: match.y,
+        });
+        flashStatus(`Showing “${match.title}”`);
+      };
+
+      button.addEventListener("click", runSearch);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          runSearch();
+        }
+      });
+    });
+  </script>
+</body>
+</html>

@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -653,18 +654,44 @@ class EmbeddingRunner:
             for candidate in candidates:
                 self._prepare_for_regeneration(candidate.title.tconst)
 
-        LOGGER.info("Generating embeddings for %d analyses", len(candidates))
+        total_titles = len(candidates)
+        batch_size = max(1, self.config.batch_size)
+        total_batches = (total_titles + batch_size - 1) // batch_size
+        LOGGER.info(
+            "Generating embeddings for %d analyses (provider=%s model=%s batch=%d)",
+            total_titles,
+            self.provider,
+            self.config.model,
+            batch_size,
+        )
         session_id = f"emb-{uuid.uuid4().hex[:10]}"
         scope = self.profile if self.variant == "default" else f"{self.profile}/{self.variant}"
         component_name = f"{self.provider}_embeddings[{scope}]"
         self.manifest.register_session(session_id, component=component_name)
 
         total_tokens = 0
-        for batch in batched(candidates, self.config.batch_size):
+        total_prompt_tokens = 0
+        processed = 0
+        overall_start = time.perf_counter()
+        for batch_index, batch in enumerate(batched(candidates, batch_size), start=1):
+            batch_start = time.perf_counter()
             texts = [self._read_analysis(candidate) for candidate in batch]
             ids = [candidate.title.tconst for candidate in batch]
             if self.config.dry_run:
-                LOGGER.info("Dry run enabled; skipping embedding batch for %s", ids)
+                processed += len(batch)
+                elapsed = time.perf_counter() - batch_start
+                elapsed_total = time.perf_counter() - overall_start
+                rate = processed / elapsed_total if elapsed_total > 0 else 0.0
+                LOGGER.info(
+                    "Batch %d/%d [dry-run] | %d titles | %.2fs (%.1f/s) | processed=%d/%d",
+                    batch_index,
+                    total_batches,
+                    len(batch),
+                    elapsed,
+                    rate,
+                    processed,
+                    total_titles,
+                )
                 continue
             try:
                 embeddings, usage = self.client.embed(texts)
@@ -679,10 +706,12 @@ class EmbeddingRunner:
                         provider=self.provider,
                         session_id=session_id,
                         error=str(exc),
-                    )
+                )
                 continue
 
-            total_tokens += usage.get("total_tokens", 0)
+            batch_tokens = usage.get("total_tokens", 0)
+            total_tokens += batch_tokens
+            total_prompt_tokens += usage.get("prompt_tokens", 0)
             if len(embeddings) != len(batch):
                 LOGGER.error(
                     "Embedding response size mismatch: expected %d, got %d",
@@ -717,6 +746,22 @@ class EmbeddingRunner:
                     input_tokens=per_doc_tokens,
                 )
 
+            processed += len(batch)
+            elapsed = time.perf_counter() - batch_start
+            elapsed_total = time.perf_counter() - overall_start
+            rate = processed / elapsed_total if elapsed_total > 0 else 0.0
+            LOGGER.info(
+                "Batch %d/%d | %d titles | %.2fs (%.1f/s) | tokens=%d | processed=%d/%d",
+                batch_index,
+                total_batches,
+                len(batch),
+                elapsed,
+                rate,
+                batch_tokens,
+                processed,
+                total_titles,
+            )
+
         if hasattr(self.client, "flush"):
             try:
                 self.client.flush()
@@ -735,7 +780,14 @@ class EmbeddingRunner:
                 f"titles={len(candidates)}"
             ),
         )
-        LOGGER.info("Embedding generation complete (%d titles)", len(candidates))
+        elapsed_total = time.perf_counter() - overall_start
+        LOGGER.info(
+            "Embedding generation complete (%d titles) in %.2fs | tokens=%d prompt_tokens=%d",
+            len(candidates),
+            elapsed_total,
+            total_tokens,
+            total_prompt_tokens,
+        )
 
     def _read_analysis(self, candidate: EmbeddingCandidate) -> str:
         try:
