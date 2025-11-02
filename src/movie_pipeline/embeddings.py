@@ -172,7 +172,7 @@ def save_embedding_vector(tconst: str, vector: list[float] | "np.ndarray", direc
 
 def _embedding_cache_paths(directory: Path) -> tuple[Path, Path]:
     cache_dir = directory / ".cache"
-    matrix_path = cache_dir / "matrix.npz"
+    matrix_path = cache_dir / "matrix.npy"
     meta_path = cache_dir / "matrix.meta.json"
     return matrix_path, meta_path
 
@@ -182,6 +182,7 @@ def _mark_embeddings_cache_dirty(directory: Path) -> None:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": 1, "dirty": True}
     meta_path.write_text(json.dumps(payload), encoding="utf-8")
+    LOGGER.info("[CACHE] Marked cache as dirty for %s", directory)
 
 
 def _snapshot_embedding_directory(files: Sequence[Path]) -> list[dict[str, int | str]]:
@@ -207,22 +208,36 @@ def _load_cached_matrix(directory: Path, snapshot: list[dict[str, int | str]]):
         return None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("[CACHE] Failed to parse cache metadata for %s: %s", directory, exc)
         return None
-    if meta.get("version") != 1 or meta.get("dirty"):
+    if meta.get("version") != 1:
+        LOGGER.warning("[CACHE] Invalid version for %s: %s", directory, meta.get("version"))
+        return None
+    if meta.get("dirty"):
+        LOGGER.info("[CACHE] Cache marked dirty for %s, rebuilding", directory)
         return None
     if meta.get("manifest") != snapshot:
+        LOGGER.info("[CACHE] Manifest mismatch for %s, rebuilding", directory)
         return None
+
+    # Get IDs from metadata - they're in the same order as the matrix rows
+    ids = meta.get("ids")
+    if not ids or not isinstance(ids, list):
+        LOGGER.warning("[CACHE] Missing or invalid IDs in metadata for %s", directory)
+        return None
+
     try:
         import numpy as np
 
-        payload = np.load(matrix_path, allow_pickle=False)
-        vectors = payload["vectors"]
-        ids = payload["ids"].tolist()
-    except Exception:
+        vectors = np.load(matrix_path, allow_pickle=False)
+    except Exception as exc:
+        LOGGER.warning("[CACHE] Failed to load cached matrix for %s: %s", directory, exc)
         return None
+
     dimension = int(meta.get("dimension") or (vectors.shape[1] if vectors.size else 0))
-    return ids, vectors.astype(np.float32, copy=False), dimension
+    LOGGER.info("[CACHE] Cache hit for %s (%d vectors, dim=%d)", directory, len(ids), dimension)
+    return ids, vectors, dimension
 
 
 def _write_cached_matrix(
@@ -237,23 +252,24 @@ def _write_cached_matrix(
         import numpy as np
 
         vectors = np.asarray(matrix, dtype=np.float32)
-        np.savez(
-            matrix_path,
-            vectors=vectors,
-            ids=np.asarray(ids, dtype=object),
-        )
+        np.save(matrix_path, vectors, allow_pickle=False)
+
+        # IDs are stored in JSON, maintaining order: ids[i] corresponds to vectors[i]
         meta_payload = {
             "version": 1,
             "dirty": False,
             "dimension": int(vectors.shape[1]) if vectors.size else 0,
             "vector_count": len(ids),
+            "ids": ids,
             "manifest": snapshot,
         }
         meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
-    except Exception:
+        LOGGER.info("[CACHE] Wrote cache for %s (%d vectors, %d source files)",
+                    directory, len(ids), len(snapshot))
+    except Exception as exc:
+        LOGGER.error("[CACHE] Failed to write cache for %s: %s", directory, exc)
         with contextlib.suppress(Exception):
             matrix_path.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
             meta_path.unlink(missing_ok=True)
 
 
@@ -943,6 +959,7 @@ def load_embeddings_matrix(vectors_dir: Path | None = None):
     if cached is not None:
         return cached
 
+    LOGGER.info("[CACHE] Cache miss, loading %d individual files from %s", len(files), directory)
     ids: list[str] = []
     vectors: list = []
     dims: int | None = None
@@ -988,7 +1005,7 @@ def load_embedding_vector(tconst: str, vectors_dir: Path | None = None) -> tuple
         try:
             import numpy as np
 
-            arr = np.load(npy_path, allow_pickle=False).astype(np.float32)
+            arr = np.load(npy_path, allow_pickle=False)
             return arr, arr.shape[-1]
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to load embedding for {tconst}: {exc}") from exc
