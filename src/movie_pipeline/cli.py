@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .analysis import AnalysisConfig, AnalysisRunner
+from .analysis import AnalysisConfig, AnalysisRunner, DeepSeekConfig
 from .embeddings import (
     EmbeddingConfig,
     EmbeddingRunner,
@@ -378,16 +378,38 @@ def cmd_run_analysis(args: argparse.Namespace) -> None:
                 LOGGER.info("Using profile-specific system prompt at %s", profile_prompt)
                 requested_prompt = profile_prompt
                 break
-    config = AnalysisConfig(
-        model=args.model,
-        max_output_tokens=args.max_output_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        retry_limit=args.retry_limit,
-        system_prompt_path=requested_prompt,
-        max_concurrency=args.max_concurrency,
-    )
-    runner = AnalysisRunner(manifest, config=config)
+
+    # Determine provider and create appropriate config
+    provider = args.provider.lower()
+
+    if provider == "deepseek":
+        # DeepSeek defaults
+        model = args.model if args.model else "deepseek-reasoner"
+        temperature = args.temperature if args.temperature is not None else 1.2
+        config = DeepSeekConfig(
+            model=model,
+            max_output_tokens=args.max_output_tokens,
+            temperature=temperature,
+            top_p=args.top_p,
+            retry_limit=args.retry_limit,
+            system_prompt_path=requested_prompt,
+            max_concurrency=args.max_concurrency,
+        )
+    else:  # grok
+        # Grok defaults
+        model = args.model if args.model else "grok-4-fast-reasoning-latest"
+        temperature = args.temperature if args.temperature is not None else 0.8
+        config = AnalysisConfig(
+            model=model,
+            max_output_tokens=args.max_output_tokens,
+            temperature=temperature,
+            top_p=args.top_p,
+            retry_limit=args.retry_limit,
+            system_prompt_path=requested_prompt,
+            max_concurrency=args.max_concurrency,
+        )
+
+    runner = AnalysisRunner(manifest, config=config, provider=provider)
     runner.run(limit=args.limit, force=args.force)
 
 
@@ -922,12 +944,27 @@ def build_parser() -> argparse.ArgumentParser:
     verify_plots_parser.set_defaults(func=cmd_verify_plots)
 
     analysis_parser = subparsers.add_parser(
-        "run-analysis", help="Generate Grok analyses for fetched plots."
+        "run-analysis", help="Generate LLM analyses for fetched plots."
     )
     analysis_parser.add_argument("--limit", type=int, default=None)
-    analysis_parser.add_argument("--model", default="grok-4-fast-reasoning-latest")
+    analysis_parser.add_argument(
+        "--provider",
+        choices=["grok", "deepseek"],
+        default="grok",
+        help="LLM provider: 'grok' (xAI) or 'deepseek'.",
+    )
+    analysis_parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name (defaults based on provider: grok-4-fast-reasoning-latest for grok, deepseek-reasoner for deepseek)",
+    )
     analysis_parser.add_argument("--max-output-tokens", type=int, default=16_000)
-    analysis_parser.add_argument("--temperature", type=float, default=0.3)
+    analysis_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Temperature (defaults: 0.8 for grok, 1.2 for deepseek)",
+    )
     analysis_parser.add_argument("--top-p", type=float, default=None)
     analysis_parser.add_argument("--retry-limit", type=int, default=2)
     analysis_parser.add_argument(
